@@ -10,21 +10,21 @@
 
 1. `docs/ai-context/PROJECT_CONTEXT.md` - краткая карта проекта, риски, команды и неизвестные места.
 2. `ARCHITECTURE.md` - существующее описание модулей, endpoint-ов, форматов и навигации.
-3. Точку входа, связанную с задачей: `manager_main.py`, `status_viewer_main.py`, `export_viewer_main.py` или `main.py`.
+3. Точку входа, связанную с задачей: `viewer_main.py`, `status_viewer_main.py` или `export_viewer_main.py`.
 4. Общие компоненты `shared/app_common.py`, `shared/theme_toggle.py`, `shared/dialogs.py`, если задача касается навигации, темы, иконок или общего UI.
-5. Конкретный модуль задачи: `Adapters`, `Sets`, `Matrix`, `Validator`, `Viewer`, `Sync`, `importxml`.
+5. Конкретный модуль задачи: `Viewer`, `Sync` или `shared`.
 6. `requirements.txt`, `.gitignore`, `.bat`-скрипты сборки, если задача связана с окружением, зависимостями или релизом.
 
 ## Как понять архитектуру
 
-- Проект - модульное PySide6 desktop-приложение для Larix/BIM/Viewer сценариев.
-- Целевое направление по словам пользователя - разделить проект на два приложения: Viewer-приложение и Manager/прочие инструменты.
-- Entry point создает `QApplication` и общий UI-каркас.
+- Проект в текущей рабочей копии - отдельное Viewer-приложение на PySide6 для Larix/BIM/Viewer сценариев.
+- Разделение уже выполнено: здесь есть общий Larix Viewer и отдельные Status Viewer и Export Viewer; Manager/прочие инструменты находятся вне этой рабочей копии.
+- Entry point создает `QApplication` и общий UI-каркас. `viewer_main.py` - общий стартовый экран Larix Viewer с карточками режимов.
 - Меню показывает карточки режимов.
 - Выбор карточки динамически загружает UI-класс из отдельного модуля.
 - Общие тема, иконки, диалоги и Excel-утилиты должны переиспользоваться из `shared/`.
 - Бизнес-сценарии находятся в крупных `ui.py` внутри доменных директорий.
-- API/БД/экспортные операции находятся в `api_tools.py`, `Viewer`, `Sync`, `Adapters`, `Sets`, `Validator`.
+- API/БД/экспортные операции находятся в `Viewer` и `Sync`.
 
 ## Как безопасно вносить изменения
 
@@ -32,7 +32,7 @@
 - Сначала проанализировать связанные файлы, затем предложить короткий план.
 - Перед изменениями проверить entrypoint, общий shared-код и модуль, который будет затронут.
 - Не рефакторить крупные `ui.py` без отдельной задачи.
-- Не менять XML/PV/CV/SET форматы без проверки совместимости.
+- Не менять форматы экспорта/импорта без проверки совместимости.
 - Не вызывать mutating API/SQL операции без явного разрешения пользователя.
 - Не логировать токены, пароли и connection strings.
 - Не использовать артефакты `build/`, `dist/`, `__pycache__` как источник истины.
@@ -40,15 +40,15 @@
 
 ## Проверять связанные файлы перед изменениями
 
-- Для изменений меню/entrypoint: `manager_main.py`, `status_viewer_main.py`, `export_viewer_main.py`, `main.py`, `shared/app_common.py`.
+- Для изменений меню/entrypoint: `viewer_main.py`, `status_viewer_main.py`, `export_viewer_main.py`, `shared/app_common.py`.
 - Для темы/иконок: `shared/theme_toggle.py`, `icon/`, локальные helpers в целевом модуле.
 - Для диалогов: `shared/dialogs.py` и локальные dialog helpers в целевом `ui.py`.
-- Для API: `api_tools.py`, модульные API helpers, `LARIX_API_BASE_URL`, auth headers и места вызовов.
+- Для API: модульные API helpers, `LARIX_API_BASE_URL`, auth headers и места вызовов.
 - Для Viewer auth: `Viewer/keycloak_auth.py`, `Viewer/ui.py`.
 - Для SQL/экспорта: `Sync/ui.py`, `Sync/odbc.py`, `Sync/tls.py`, `config_example.txt`.
-- Для Excel: `shared/excel_parser.py`, `shared/excel_template.py`, `Шаблон Excel.xlsx`, целевой модуль.
-- Для сборки: `build_exe.bat`, `build_export_viewer.bat`, `.spec`, `requirements.txt`.
-- Если задача касается разделения приложений, сначала проверить `manager_main.py`, `status_viewer_main.py`, `export_viewer_main.py`, отсутствующий `viewer_main.py`, `main.py` и `build_exe.bat`.
+- Для Excel/табличного импорта-экспорта: `shared/excel_parser.py`, `shared/excel_template.py`, целевой модуль.
+- Для сборки: `build_viewer.bat`, `build_status_viewer.bat`, `build_export_viewer.bat`, `requirements.txt`.
+- Если задача касается разделения приложений, учитывать, что в этой рабочей копии нет `manager_main.py`, `main.py` и `build_exe.bat`; актуальные entrypoint-ы - `viewer_main.py`, `status_viewer_main.py` и `export_viewer_main.py`.
 
 ## Проверки после изменений
 
@@ -63,19 +63,18 @@ py -3 -m compileall .
 Запуск конкретного приложения:
 
 ```bat
-py -3 manager_main.py
 py -3 status_viewer_main.py
 py -3 export_viewer_main.py
+py -3 viewer_main.py
 ```
 
 Сборка только при задачах релиза/упаковки:
 
 ```bat
+build_viewer.bat
+build_status_viewer.bat
 build_export_viewer.bat
-build_exe.bat
 ```
-
-Важно: `build_exe.bat` при обзоре ссылался на `viewer_main.py`, который не найден. Перед использованием этого скрипта проверить актуальность entrypoint-ов.
 
 ## Чеклист перед началом любой задачи
 
@@ -83,7 +82,7 @@ build_exe.bat
 - Если явного запроса на код нет, не писать код.
 - Найти релевантный entrypoint и модуль.
 - Прочитать связанные shared-файлы перед изменениями.
-- Проверить, затрагивает ли задача API, БД, auth, XML/PV/CV/SET форматы или сборку.
+- Проверить, затрагивает ли задача API, БД, auth, форматы экспорта/импорта или сборку.
 - Отделить факты из файлов от предположений.
 - Сформулировать план и риски до изменений.
 - После изменений назвать выполненные проверки или объяснить, почему они не запускались.

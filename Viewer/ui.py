@@ -773,7 +773,7 @@ class MainWindow(QMainWindow):
         apply_window_icon(self, icon_dir=ICON_DIR)
 
         self.schema_data = {}
-        self.checked_models = {}       # mid -> QCheckBox (text = model name)
+        self.checked_models = []       # [(proj_id, mid, QCheckBox)]
         self.checked_containers = {}   # cid -> QCheckBox (text = container title)
         self.container_titles = {}     # cid -> title (для логов)
         self.model_titles = {}         # mid -> title
@@ -1319,13 +1319,13 @@ class MainWindow(QMainWindow):
             cb = QCheckBox(f"{name}")
             cb.toggled.connect(self.refresh_container_highlights)
             layout.addWidget(cb)
-            self.checked_models[mid] = cb
+            self.checked_models.append((proj_id, mid, cb))
             self.model_titles[mid] = name
             self._model_to_project[mid] = proj_id
 
     # --- Schemas / Attributes ---
     def load_schemas_attrs(self):
-        models = [mid for mid, cb in self.checked_models.items() if cb.isChecked()]
+        models = [(proj_id, mid) for proj_id, mid, cb in self.checked_models if cb.isChecked()]
         self.schema_data.clear()
         self.schema_combo.clear()
         self.attr_combo.clear()
@@ -1334,14 +1334,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Внимание", "Выберите хотя бы одну модель.")
             return
 
-        if not getattr(self, '_model_to_project', None):
-            QMessageBox.critical(self, "Ошибка", "Сначала загрузите проекты.")
-            return
-
-        for mid in models:
-            proj_id = self._model_to_project.get(mid)
-            if proj_id is None:
-                continue
+        for proj_id, mid in models:
             schemas = api_get(f"{self._get_external_base_url()}/api/attribute-schema/projectid-jimcid",
                               EXTERNAL_HEADERS, {"projectId": proj_id, "jimcId": mid}) or []
             for s in schemas:
@@ -1412,7 +1405,7 @@ class MainWindow(QMainWindow):
     # --- Matching & highlighting ---
     def refresh_container_highlights(self):
         """Подсветка и сортировка контейнеров по совпадению базовых имён с отмеченными моделями."""
-        selected_norms = {normalize_name(cb.text()) for cb in self.checked_models.values() if cb.isChecked()}
+        selected_norms = {normalize_name(cb.text()) for _, _, cb in self.checked_models if cb.isChecked()}
 
         widgets = []
         for i in range(self.container_layout.count()-1):
@@ -1449,7 +1442,7 @@ class MainWindow(QMainWindow):
             _popup_error(self, "Не удалось получить ID схемы/атрибута")
             return
 
-        selected_models = [(mid, cb.text()) for mid, cb in self.checked_models.items() if cb.isChecked()]
+        selected_models = [(proj_id, mid, cb.text()) for proj_id, mid, cb in self.checked_models if cb.isChecked()]
         if not selected_models:
             _popup_error(self, "Выберите модели")
             return
@@ -1464,7 +1457,7 @@ class MainWindow(QMainWindow):
         # Собираем nativeId по каждой модели отдельно (для более точных логов)
         model_native = {}  # mid -> set(nativeIds)
         union_native = set()
-        for mid, _name in selected_models:
+        for proj_id, mid, _name in selected_models:
             values = api_get(
                 f"{self._get_external_base_url()}/api/attribute-value/jimcid-attributeid",
                 EXTERNAL_HEADERS, {"jimcId": mid, "attributeId": attr_id}
@@ -1484,7 +1477,7 @@ class MainWindow(QMainWindow):
 
         # Подготовим мапу: нормализованное имя -> список моделей с таким именем
         norm_to_models = {}
-        for mid, name in selected_models:
+        for _proj_id, mid, name in selected_models:
             norm = normalize_name(name)
             norm_to_models.setdefault(norm, []).append(name)
 

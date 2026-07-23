@@ -2,9 +2,9 @@
 
 ## Назначение проекта
 
-Addon Manager - десктопное Windows-приложение на Python/PySide6 для работы с Larix/BIM-сценариями: управление адаптерами, наборами, матрицами коллизий, профилями параметров/валидации, статусами Viewer и синхронизацией/экспортом BIM-данных.
+Larix Viewer - отдельное десктопное Windows-приложение на Python/PySide6 для Viewer-сценариев: управление статусами Viewer и синхронизация/экспорт BIM-данных.
 
-Контекст подтвержден файлами `ARCHITECTURE.md`, `main.py`, `manager_main.py`, `status_viewer_main.py`, `export_viewer_main.py`, модулями `Adapters`, `Sets`, `Matrix`, `Validator`, `Viewer`, `Sync`, `shared` и `importxml`.
+Контекст подтвержден файлами `ARCHITECTURE.md`, `viewer_main.py`, `status_viewer_main.py`, `export_viewer_main.py`, модулями `Viewer`, `Sync` и `shared`. В текущей рабочей копии нет `main.py`, `manager_main.py`, `Adapters`, `Sets`, `Matrix`, `Validator`, `api_tools.py` и `importxml`.
 
 ## Стек технологий
 
@@ -14,8 +14,8 @@ Addon Manager - десктопное Windows-приложение на Python/Py
 - HTTP/API: requests, urllib.request.
 - База данных: SQL Server через pyodbc; SQLite для локального экспорта.
 - Надежность HTTP/операций: tenacity.
-- Сборка Windows exe: PyInstaller через `.bat`-скрипты и `.spec`.
-- Форматы данных: XML, `.cv`, `.set`, `.pv`, `.xlsx/.xls`, `.json`, `.parquet`, `.sqlite/.db`, CSV.
+- Сборка Windows exe: PyInstaller через `.bat`-скрипты.
+- Форматы данных: `.json`, `.parquet`, `.sqlite/.db`, CSV, данные Viewer/локального API.
 
 Зависимости перечислены в `requirements.txt`:
 
@@ -33,9 +33,9 @@ pyinstaller
 
 ## Архитектура проекта
 
-Проект организован как модульное desktop-приложение с несколькими точками входа. Общий UI-каркас находится в `shared/app_common.py`, а общие темы, иконки, диалоги и Excel-утилиты вынесены в `shared/`.
+Проект организован как отдельное Viewer desktop-приложение с тремя точками входа. Общий UI-каркас находится в `shared/app_common.py`, а общие темы, иконки, диалоги и Excel-утилиты вынесены в `shared/`.
 
-Основная навигация строится вокруг карточек режимов. Карточка выбирает модуль, модуль динамически загружается из директории через `importlib.util.spec_from_file_location`. В старом объединенном входе `main.py` и новом общем каркасе `shared/app_common.py` есть схожая логика загрузки модулей и проверки API.
+Основная навигация строится вокруг общего каркаса `shared/app_common.py`. `viewer_main.py` показывает общий стартовый экран Larix Viewer с карточками "Статусы" и "Элементы". В специализированных entrypoint-ах включен `skip_menu=True`: `status_viewer_main.py` сразу открывает `Viewer/ui.py`, а `export_viewer_main.py` сразу открывает BIM Sync/экспорт.
 
 Архитектурный паттерн:
 
@@ -43,32 +43,23 @@ pyinstaller
 - применяется синхронизация темы и общая палитра;
 - создается главное окно или меню режимов;
 - выбранный режим загружает UI-класс из конкретного модуля;
-- модули работают с локальным API, внешним Viewer API, Excel/XML-файлами или SQL Server в зависимости от сценария.
+- модули работают с локальным API, внешним Viewer API, табличными файлами или SQL Server в зависимости от сценария.
 
 ## Структура директорий и файлов
 
-- `main.py` - объединенная точка входа с режимами Manager/Viewer, описана в `ARCHITECTURE.md`; содержит дублирующуюся с `shared/app_common.py` логику меню и загрузки модулей.
-- `manager_main.py` - точка входа для `Larix Plugin Manager`; загружает `Adapters`, `Sets`, `Matrix`, `Validator`.
+- `viewer_main.py` - общая точка входа для `Larix Viewer`; стартовый экран с карточками "Статусы" и "Элементы".
 - `status_viewer_main.py` - точка входа для `Larix Status Viewer`; загружает `Viewer/ui.py`.
 - `export_viewer_main.py` - точка входа для `Larix Export Viewer`; запускает BIM Sync/экспорт через общий каркас.
-- `api_tools.py` - каталог API-оберток и JSON-схем tools для AI-агента; содержит локальные и внешние Viewer API endpoints.
 - `ARCHITECTURE.md` - существующее описание архитектуры, модулей, endpoint-ов и форматов.
 - `requirements.txt` - зависимости Python.
 - `config_example.txt` - пример конфигурации SQL Server.
-- `build_exe.bat` - сборка Manager и Viewer через PyInstaller.
+- `build_viewer.bat` - сборка общего Larix Viewer через PyInstaller.
+- `build_status_viewer.bat` - сборка Status Viewer через PyInstaller.
 - `build_export_viewer.bat` - сборка Export Viewer через PyInstaller.
-- `Larix_Export_Viewer.spec` - сгенерированный/ручной spec PyInstaller для Export Viewer; содержит абсолютные пути текущей машины.
-- `Шаблон Excel.xlsx` - Excel-шаблон для пользовательских сценариев импорта/экспорта.
 - `icon/` - основной набор иконок и логотипов приложения.
 - `shared/` - общие компоненты: тема, диалоги, общий каркас меню, Excel parser/template.
-- `Adapters/` - редактор адаптеров и XML-сериализация привязок параметров.
-- `Sets/` - управление профилями/наборами Larix.
-- `Matrix/` - генератор матриц коллизий.
-- `Validator/` - генерация профилей параметров/валидации из Excel.
 - `Viewer/` - сценарии статусов Viewer и Keycloak-аутентификация.
 - `Sync/` - BIM Sync, SQL Server, ODBC/TLS диагностика, экспорт CSV/Parquet/SQLite.
-- `importxml/` - отдельные утилиты для загрузки XML change list и импорта/экспорта параметров; `README.md` почти пустой.
-- `viewer subd/` - дополнительный/старый подмодуль viewer sync GUI; назначение требует уточнения, так как имя директории нетипичное и не описано в `ARCHITECTURE.md`.
 - `build/`, `dist/`, `__pycache__/` - артефакты сборки/кэши; не являются исходным кодом.
 
 ## Ключевые модули
@@ -78,17 +69,12 @@ pyinstaller
 - `shared/dialogs.py` - общие диалоги и QMessageBox-обертки.
 - `shared/excel_parser.py` - чтение листов параметров из Excel и определение layout листов.
 - `shared/excel_template.py` - экспорт встроенных шаблонов в Excel.
-- `Adapters/ui.py` - редактор адаптеров, `AdapterDoc`, `Binding`, `BindingQueue`, `TransformSettings`, API-загрузка проектов/контейнеров/параметров, XML `Adapter.xml`.
-- `Sets/ui.py` - UI профилей/наборов Larix, API-загрузка проектов/контейнеров/параметров, Excel sheet picker, API select dialog.
-- `Matrix/ui.py` - генератор `.cv`/XML профилей коллизий из Excel-матриц; использует шаблоны XML и worker в `QThread`.
-- `Validator/ui.py` и `Validator/Parameters.py` - генерация `.pv`/XML профилей параметров из Excel, маппинг Excel/API параметров, сохранение маппингов JSON.
 - `Viewer/ui.py` - создание/управление статусами, работа с локальными проектами/контейнерами и внешним Viewer API, токен/Bearer-аутентификация.
 - `Viewer/keycloak_auth.py` - Keycloak login/refresh/logout, ROPC и browser-like flow; endpoint `https://keycloak.bim-info.ru`.
 - `Sync/ui.py` - крупный модуль BIM Sync: выбор режима, SQL Server синхронизация, экспорт Power BI/CSV/Parquet/SQLite, загрузка проектов/моделей/элементов/свойств через Viewer API.
 - `Sync/odbc.py` - диагностика и построение подключения ODBC к SQL Server.
 - `Sync/tls.py` - TLS/SSL диагностика, настройка requests session и безопасные запросы.
 - `Sync/check.py` - проверка parquet-файлов.
-- `api_tools.py` - отдельный каталог API endpoints для AI/автоматизации; может выполнять mutating-запросы, например создание параметров и batch update элементов.
 
 ## Основные сущности и доменные понятия
 
@@ -98,21 +84,13 @@ pyinstaller
 - Element/элемент - элемент BIM-модели.
 - Parameter/параметр - определение или значение параметра модели.
 - Global component/attribute schema/attribute - структура атрибутов для сопоставления.
-- Adapter - XML-документ привязки атрибутов к параметрам и преобразований.
-- Binding - привязка параметра к атрибуту адаптера.
-- Set/profile - профиль Larix/наборы.
-- Matrix/collision profile - матрица коллизий и генерируемый XML `.cv`.
-- PV profile - профиль параметров/валидации `.pv`.
 - Status - статус элементов Viewer.
 - BIM Sync export - выгрузка элементов и свойств в SQL Server, CSV, Parquet или SQLite.
 
 ## Точки входа
 
-- `python main.py` - объединенное приложение Manager/Viewer, исторически описанное в `ARCHITECTURE.md`.
-- `python manager_main.py` - Larix Plugin Manager: адаптеры, наборы, матрицы, параметры.
 - `python status_viewer_main.py` - Larix Status Viewer: статусы.
 - `python export_viewer_main.py` - Larix Export Viewer: экспорт/синхронизация.
-- `python -m importxml.XML` или `python importxml/XML.py` - отдельная утилита XML change list uploader; подтверждено наличием `main()` и `if __name__ == "__main__"`.
 - Некоторые UI-модули имеют самостоятельный `if __name__ == "__main__"`, но их запуск нужно проверять отдельно, так как основной сценарий идет через точки входа выше.
 
 ## Команды запуска, сборки и проверок
@@ -126,16 +104,16 @@ py -3 -m pip install -r requirements.txt
 Запуск основных приложений:
 
 ```bat
-py -3 manager_main.py
+py -3 viewer_main.py
 py -3 status_viewer_main.py
 py -3 export_viewer_main.py
-py -3 main.py
 ```
 
 Сборка:
 
 ```bat
-build_exe.bat
+build_viewer.bat
+build_status_viewer.bat
 build_export_viewer.bat
 ```
 
@@ -153,17 +131,15 @@ py -3 -m compileall .
 ## Интеграции, API, БД и внешние сервисы
 
 - Локальный API по умолчанию: `http://localhost:5000`.
-- Управление локальным API через `LARIX_API_BASE_URL` в `main.py`, `shared/app_common.py`, `Validator`, `Matrix`, `Sets`, `api_tools.py`.
-- Внешний Viewer API по умолчанию в разных местах:
-  - `https://viewer.larix.ru` в `api_tools.py`, `Viewer/ui.py`, `Sync/ui.py`;
-  - `https://bwv.testing.bim-info.ru` в `Viewer/ui.py` как `EXTERNAL_BASE_URL`.
+- Управление локальным API через `LARIX_API_BASE_URL`/`DEFAULT_API_BASE_URL` в `shared/app_common.py` и модульные helper-ы.
+- Внешний Viewer API по умолчанию встречается в разных местах: `https://viewer.larix.ru` в `Viewer/ui.py`, `Sync/ui.py`; `https://bwv.testing.bim-info.ru` в `Viewer/ui.py` как `EXTERNAL_BASE_URL`.
 - Keycloak: `https://keycloak.bim-info.ru`, realm `BIMInfo`, redirect `https://viewer.larix.ru/app` в `Viewer/keycloak_auth.py`.
 - SQL Server через ODBC/pyodbc; пример подключения в `config_example.txt`.
 - SQLite export в `Sync/ui.py`.
 - Parquet export через pandas/pyarrow.
-- Excel import/export через pandas/openpyxl и `Шаблон Excel.xlsx`.
+- Табличный экспорт/импорт через pandas/openpyxl, если используется конкретным модулем.
 
-Подтвержденные локальные API endpoints из `ARCHITECTURE.md` и `api_tools.py`:
+Подтвержденные локальные API endpoints из `ARCHITECTURE.md` и текущих модулей:
 
 - `GET /api/project/projects`
 - `GET /api/imcContainer/getProjectImcContainers/{id}`
@@ -191,10 +167,8 @@ py -3 -m compileall .
 - `requirements.txt` - единственный найденный dependency-файл.
 - `.gitignore` - настроен по принципу ignore-all с allowlist исходных директорий и файлов; новые `docs/ai-context/*` могут быть проигнорированы Git, если `.gitignore` не расширить отдельно.
 - `config_example.txt` - пример SQL Server credentials; не использовать как реальные секреты.
-- `build_exe.bat` - ожидает `viewer_main.py`, но такой файл не найден при обзоре. Возможно, это устаревшая ссылка или файл отсутствует в рабочей копии.
 - `build_export_viewer.bat` - актуально ссылается на `export_viewer_main.py`.
-- `Larix_Export_Viewer.spec` - содержит абсолютные пути `X:\Projects\IBIM\Addon-manager`; при переносе проекта может потребовать регенерации.
-- `dist/`, `build/`, `.spec`, `__pycache__`, логи - артефакты, не опираться на них как на источник истины.
+- `dist/`, `build/`, `__pycache__`, логи - артефакты, не опираться на них как на источник истины.
 
 ## Соглашения по стилю и структуре
 
@@ -205,40 +179,33 @@ py -3 -m compileall .
 - Для длительных операций используется `QThread` + worker, чтобы не блокировать GUI.
 - API base URL должен идти через `LARIX_API_BASE_URL` или поле UI, а не жестко прописываться в новых местах.
 - Стиль кодовой базы смешанный: часть модулей крупные монолитные `ui.py`, часть логики дублируется между модулями. Не рефакторить без отдельной задачи.
+- Чекбоксы стилизуются через `icon/check.png` и `icon/select.png`; перед исправлением логики выбора проверять соответствие визуального состояния и `QCheckBox.isChecked()`.
 
 ## Известные ограничения
 
 - Не найдено автоматических тестов и CI/CD.
 - Нет `README.md` в корне; основная документация - `ARCHITECTURE.md`.
-- `importxml/README.md` содержит только заголовок.
-- `build_exe.bat` ссылается на `viewer_main.py`, которого не найдено; сборка обоих exe через этот скрипт может падать.
 - `.gitignore` по умолчанию игнорирует почти все, кроме allowlist; `docs/ai-context/**` добавлен в allowlist для AI-контекста.
 - В проекте есть сгенерированные артефакты `build/`, `dist/`, `__pycache__`, `bim_sync.log`; они не должны использоваться для анализа бизнес-логики.
-- `Sync/ui.py`, `Validator/Parameters.py`, `Adapters/ui.py` и другие UI-файлы очень большие; изменения в них требуют точечного анализа связанных функций.
+- `Sync/ui.py` и `Viewer/ui.py` большие; изменения в них требуют точечного анализа связанных функций.
 - Несколько мест задают разные external Viewer base URL (`viewer.larix.ru`, `bwv.testing.bim-info.ru`); фактическое production/testing окружение нужно уточнять.
 
 ## Текущие пользовательские уточнения
 
-- Пользователь хочет разделить проект на два отдельных приложения: одно для всего, что связано с Viewer, второе - для всего остального.
-- `viewer_main.py`, вероятно, должен существовать как отдельная программа Viewer, но его нельзя создавать или восстанавливать без отдельного явного промта на реализацию.
-- Пользователь пока не определил обязательный набор проверок и не уточнил различие Viewer API окружений.
+- Пользователь уже разделил проект: текущая рабочая копия содержит Viewer-приложение со статусами и экспортом.
+- Ошибка в Larix Status Viewer: при нажатии `Загрузить схемы` появляется предупреждение `Выберите хотя бы одну модель`, хотя пользователь видит отмеченные модели. Первичная точка анализа - `Viewer/ui.py::load_schemas_attrs()` и хранение чекбоксов в `self.checked_models`. Вероятная причина - визуальная инверсия QSS-иконок: `QCheckBox::indicator:unchecked` использует иконку `check`, а `checked` использует `select`.
+- Пользователь пока не уточнил различие Viewer API окружений.
 
 ## Потенциально опасные места
 
-- `api_tools.py` содержит mutating API wrappers: создание параметров, установка значений и batch update элементов. Не вызывать без явного разрешения пользователя и тестового окружения.
 - `Viewer/keycloak_auth.py` и auth-логика в `Viewer/ui.py` работают с токенами и паролями. Не логировать секреты, не менять flow без проверки с реальным окружением.
 - `Sync/ui.py` выполняет операции с SQL Server, CSV/Parquet/SQLite и внешним API; есть риск порчи данных или долгих операций.
 - `Sync/odbc.py` и `Sync/tls.py` влияют на подключение к БД/API и пользовательскую диагностику ошибок.
-- XML/PV/CV/SET генераторы в `Adapters`, `Validator`, `Matrix`, `Sets` формируют файлы для внешних Larix/BIM-инструментов; формат менять только после проверки совместимости.
 - `shared/theme_toggle.py` и `shared/app_common.py` используются многими entrypoint-ами; изменения могут повлиять на все приложения.
 - `.bat`-скрипты сборки удаляют старые exe/build-директории; запускать их осознанно.
-- `Larix_Export_Viewer.spec` содержит абсолютные пути; ручные изменения могут ломать сборку на других машинах.
 
 ## Что нужно уточнить у пользователя
 
-- Как именно разделить Viewer-приложение и Manager-приложение: какие режимы должны войти в Viewer, а какие остаться в Manager?
-- Должен ли `viewer_main.py` объединять `status_viewer_main.py` и `export_viewer_main.py`, или это должен быть отдельный вход только для одного Viewer-сценария?
 - Какие окружения являются production/test для Viewer API: `https://viewer.larix.ru` или `https://bwv.testing.bim-info.ru`?
 - Какие проверки считать обязательными перед сдачей: только `compileall`, ручной запуск GUI, сборка PyInstaller, smoke-тест с API/БД?
 - Нужно ли добавить тестовый фреймворк/линтеры в будущем, или проект сознательно работает без них?
-- Какой статус у `viewer subd/`: актуальный модуль, эксперимент или устаревший код?

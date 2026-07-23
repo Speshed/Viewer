@@ -12,9 +12,12 @@
 !docs/ai-context/
 
 # tracked files
+!viewer_main.py
 !status_viewer_main.py
 !export_viewer_main.py
 !ARCHITECTURE.md
+!build_viewer.bat
+!build_status_viewer.bat
 !build_export_viewer.bat
 !config_example.txt
 !requirements.txt

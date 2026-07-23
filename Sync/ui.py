@@ -61,7 +61,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QScrollArea, QFrame, QCheckBox,
     QProgressBar, QMessageBox, QFileDialog, QGroupBox, QToolButton,
     QStyleOptionButton, QStyle, QPlainTextEdit,
-    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QGraphicsDropShadowEffect, QSizePolicy
+    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QGraphicsDropShadowEffect, QSizePolicy, QTabWidget
 )
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1722,46 +1722,280 @@ def get_sample_properties(site, token, jimc_id):
     """Получение списка доступных параметров модели через tree-table distinct-c."""
     token = normalize_token(token)
     url = f"{site}/api/tree-table/distinct-c"
-    
+
     try:
         session = get_session()
-        response = session.post(
-            url,
-            params={"jimcIdArr": str(jimc_id), "withCount": "0"},
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={},
-            timeout=REQUEST_TIMEOUT
-        )
-        
-        if response.status_code in (401, 403):
-            raise TokenExpiredError(f"Ошибка авторизации (код {response.status_code})")
-        
-        response.raise_for_status()
-        data = response.json()
-
-        if isinstance(data, dict):
-            items = data.get("data") or data.get("items") or data.get("result") or []
-        else:
-            items = data or []
-
         properties = []
         seen = set()
-        for item in items:
-            if isinstance(item, str):
-                c_value = item
-            elif isinstance(item, dict):
-                c_value = item.get("c") or item.get("value") or item.get("name")
+        page = 1
+        page_size = 500
+
+        while True:
+            response = session.post(
+                url,
+                params={"jimcIdArr": str(jimc_id), "withCount": "0"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"pagination": {"page": page, "pageSize": page_size}},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code in (401, 403):
+                raise TokenExpiredError(f"Ошибка авторизации (код {response.status_code})")
+
+            response.raise_for_status()
+            data = response.json()
+
+            if isinstance(data, dict):
+                items = data.get("data") or data.get("items") or data.get("result") or data.get("rows") or []
+                next_page = data.get("nextPage")
+                page_count = data.get("pageCount")
             else:
-                c_value = None
-            if c_value and c_value not in seen:
-                properties.append(c_value)
-                seen.add(c_value)
+                items = data or []
+                next_page = None
+                page_count = None
+
+            if not items:
+                break
+
+            for item in items:
+                if isinstance(item, str):
+                    c_value = item
+                elif isinstance(item, dict):
+                    c_value = item.get("be_c") or item.get("c") or item.get("value") or item.get("name")
+                else:
+                    c_value = None
+
+                if c_value and c_value not in seen:
+                    properties.append(c_value)
+                    seen.add(c_value)
+
+            if next_page is not None:
+                try:
+                    next_page = int(next_page)
+                except Exception:
+                    next_page = None
+                if next_page is None or next_page <= page:
+                    break
+                page = next_page
+                continue
+
+            if page_count is not None:
+                try:
+                    page_count = int(page_count)
+                except Exception:
+                    page_count = None
+                if page_count is None or page >= page_count:
+                    break
+                page += 1
+                continue
+
+            if len(items) < page_size:
+                break
+
+            page += 1
+
+        log_info(f"get_sample_properties: модель {jimc_id}, найдено {len(properties)} параметров")
         return properties
     except TokenExpiredError:
         raise
     except Exception as e:
         log_error(f"Ошибка получения списка параметров для модели {jimc_id}: {e}")
         return []
+
+
+def _extract_api_items(data):
+    if isinstance(data, dict):
+        for key in ("data", "items", "result", "rows"):
+            items = data.get(key)
+            if items is not None:
+                return items if isinstance(items, list) else [items]
+        return []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def extract_status_value(raw_value):
+    if raw_value in (None, {}, []):
+        return None
+    if isinstance(raw_value, dict):
+        for key in ("value", "text", "s", "d", "n", "b"):
+            if key in raw_value and raw_value[key] is not None:
+                return raw_value[key]
+        return json.dumps(raw_value, ensure_ascii=False)
+    if isinstance(raw_value, list):
+        values = [extract_status_value(item) for item in raw_value]
+        values = [value for value in values if not is_empty_value(value)]
+        return "; ".join(str(value) for value in values) if values else None
+    return raw_value
+
+
+def get_sample_status_attributes(site, token, project_id, jimc_id):
+    token = normalize_token(token)
+    session = get_session()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    result = {}
+
+    try:
+        schemas_url = f"{site}/api/attribute-schema/projectid-jimcid"
+        response = session.get(
+            schemas_url,
+            params={"projectId": project_id, "jimcId": jimc_id},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code in (401, 403):
+            raise TokenExpiredError(f"Ошибка авторизации (код {response.status_code})")
+        response.raise_for_status()
+
+        schema_items = _extract_api_items(response.json())
+        for schema_item in schema_items:
+            if not isinstance(schema_item, dict):
+                continue
+            schema_id = schema_item.get("id") or schema_item.get("schemaId")
+            if schema_id is None:
+                continue
+            schema_title = schema_item.get("title") or schema_item.get("name") or schema_item.get("schemaTitle") or ""
+
+            attrs_url = f"{site}/api/attribute/attributeschemaid-jimcid"
+            attrs_response = session.get(
+                attrs_url,
+                params={"attributeSchemaId": schema_id, "jimcId": jimc_id},
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if attrs_response.status_code in (401, 403):
+                raise TokenExpiredError(f"Ошибка авторизации (код {attrs_response.status_code})")
+            attrs_response.raise_for_status()
+
+            attr_items = _extract_api_items(attrs_response.json())
+            for attr_item in attr_items:
+                if not isinstance(attr_item, dict):
+                    continue
+                attribute_id = attr_item.get("id") or attr_item.get("attributeId")
+                if attribute_id is None:
+                    continue
+                key = (int(schema_id), int(attribute_id))
+                result[key] = {
+                    "schemaId": int(schema_id),
+                    "schemaTitle": str(schema_title),
+                    "attributeId": int(attribute_id),
+                    "attributeTitle": str(attr_item.get("title") or attr_item.get("name") or attr_item.get("attributeTitle") or ""),
+                }
+
+        return sorted(
+            result.values(),
+            key=lambda item: (
+                item.get("schemaTitle", "").lower(),
+                item.get("attributeTitle", "").lower(),
+                item.get("schemaId", 0),
+                item.get("attributeId", 0),
+            ),
+        )
+    except TokenExpiredError:
+        raise
+    except Exception as e:
+        log_error(f"Ошибка получения списка статусов для модели {jimc_id}: {e}")
+        return []
+
+
+def get_status_attribute_values(site, token, jimc_id, attribute_id):
+    token = normalize_token(token)
+    url = f"{site}/api/attribute-value/jimcid-attributeid"
+    try:
+        session = get_session()
+        response = session.get(
+            url,
+            params={"jimcId": jimc_id, "attributeId": attribute_id},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code in (401, 403):
+            raise TokenExpiredError(f"Ошибка авторизации (код {response.status_code})")
+        response.raise_for_status()
+        return _extract_api_items(response.json())
+    except Exception as e:
+        log_error(f"Ошибка получения значений статуса attributeId={attribute_id}, jimc_id={jimc_id}: {e}")
+        return []
+
+
+def build_status_attribute_rows(df_elems, elem_by_nid, elem_by_eid, selected_status_attributes, fetch_values_func, proj_id, jimc_id, sync_time_str):
+    if df_elems.empty or not selected_status_attributes:
+        return []
+
+    rows = []
+    for status_attr in selected_status_attributes:
+        attribute_id = status_attr.get("attributeId")
+        if attribute_id is None:
+            continue
+
+        status_values = fetch_values_func(jimc_id, attribute_id) or []
+        if not status_values:
+            continue
+
+        grouped_statuses = {}
+        for status_item in status_values:
+            element_id = None
+            nid = status_item.get("nid")
+            if nid is not None:
+                try:
+                    nid = int(nid)
+                except Exception:
+                    pass
+                element_id = elem_by_nid.get(nid)
+            if element_id is None:
+                eid = status_item.get("eid")
+                if eid is not None:
+                    try:
+                        eid = int(eid)
+                    except Exception:
+                        pass
+                    element_id = elem_by_eid.get(eid)
+            if element_id is None:
+                continue
+
+            raw_value = extract_status_value(status_item.get("value"))
+            if is_empty_value(raw_value):
+                continue
+            value_text = str(raw_value).strip()
+            if not value_text:
+                continue
+
+            schema_id = status_attr.get("schemaId")
+            key = (element_id, jimc_id, proj_id, schema_id, attribute_id)
+            bucket = grouped_statuses.setdefault(
+                key,
+                {
+                    "idProject": proj_id,
+                    "idModel": jimc_id,
+                    "idElement": element_id,
+                    "eid": status_item.get("eid"),
+                    "nid": status_item.get("nid"),
+                    "statusSchemaId": schema_id,
+                    "statusSchemaTitle": status_attr.get("schemaTitle", ""),
+                    "attributeId": attribute_id,
+                    "attributeTitle": status_attr.get("attributeTitle", ""),
+                    "_values": [],
+                    "_seen": set(),
+                },
+            )
+            if bucket.get("eid") in (None, "") and status_item.get("eid") is not None:
+                bucket["eid"] = status_item.get("eid")
+            if bucket.get("nid") in (None, "") and status_item.get("nid") is not None:
+                bucket["nid"] = status_item.get("nid")
+            if value_text not in bucket["_seen"]:
+                bucket["_seen"].add(value_text)
+                bucket["_values"].append(value_text)
+
+        for bucket in grouped_statuses.values():
+            values = [value for value in bucket.pop("_values", []) if value]
+            bucket.pop("_seen", None)
+            if values:
+                bucket["attributeValue"] = "; ".join(values)
+                bucket["last_updated"] = sync_time_str
+                rows.append(bucket)
+
+    return rows
 
 
 def extract_property_value(pv_item):
@@ -1939,6 +2173,74 @@ def save_properties_wide_to_sql(properties_list, property_paths, schema="staging
     log_timing(f"Wide INSERT (ElementPropertiesWide), {len(property_paths)} столбцов", sql_start, total_inserted)
 
 
+def save_status_attributes_to_sql(df_statuses, schema="staging", db_config=None):
+    if df_statuses.empty:
+        return
+
+    sql_start = time.time()
+    conn_str = get_connection_str(db_config)
+    table_name = f"{schema}.ElementStatusAttributes"
+    columns = [
+        "idProject",
+        "idModel",
+        "idElement",
+        "eid",
+        "nid",
+        "statusSchemaId",
+        "statusSchemaTitle",
+        "attributeId",
+        "attributeTitle",
+        "attributeValue",
+        "last_updated",
+    ]
+
+    with pyodbc.connect(conn_str) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}') EXEC('CREATE SCHEMA {schema}')")
+        conn.commit()
+
+        create_sql = f"""
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'{table_name}') AND type = 'U')
+        CREATE TABLE {table_name} (
+            [idProject] BIGINT,
+            [idModel] BIGINT,
+            [idElement] BIGINT,
+            [eid] BIGINT,
+            [nid] BIGINT,
+            [statusSchemaId] BIGINT,
+            [statusSchemaTitle] NVARCHAR(MAX),
+            [attributeId] BIGINT,
+            [attributeTitle] NVARCHAR(MAX),
+            [attributeValue] NVARCHAR(MAX),
+            [last_updated] DATETIME2
+        )
+        """
+        cursor.execute(create_sql)
+        conn.commit()
+
+        df_clean = df_statuses.where(pd.notnull(df_statuses), None).copy()
+        for col in columns:
+            if col not in df_clean.columns:
+                df_clean[col] = None
+        if "last_updated" in df_clean.columns:
+            df_clean["last_updated"] = pd.to_datetime(df_clean["last_updated"], errors="coerce")
+        records = [tuple(row) for row in df_clean.reindex(columns=columns).values]
+        placeholders = ", ".join(["?" for _ in columns])
+        col_names = ", ".join([f"[{col}]" for col in columns])
+        insert_sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
+
+        cursor.fast_executemany = True
+        total_inserted = 0
+        for i in range(0, len(records), INSERT_CHUNK_SIZE):
+            chunk = records[i:i + INSERT_CHUNK_SIZE]
+            cursor.executemany(insert_sql, chunk)
+            total_inserted += len(chunk)
+            log_debug(f"Status insert: chunk {i//INSERT_CHUNK_SIZE + 1}, {len(chunk)} записей")
+        conn.commit()
+
+    log_timing("SQL INSERT (ElementStatusAttributes)", sql_start, total_inserted)
+
+
 def save_to_csv(df, output_path, filename):
     if df.empty:
         return 0
@@ -1966,7 +2268,7 @@ def save_to_sqlite(df, conn, table_name):
     return len(df)
 
 
-def save_all_to_sqlite(df_projects, df_models, df_elements, df_properties, output_path, selected_properties=None, include_empty_rows=False):
+def save_all_to_sqlite(df_projects, df_models, df_elements, df_properties, output_path, selected_properties=None, include_empty_rows=False, df_statuses=None, selected_status_attributes=None):
     import sqlite3
     os.makedirs(output_path, exist_ok=True)
     db_path = os.path.join(output_path, "bim_data.db")
@@ -2019,15 +2321,29 @@ def save_all_to_sqlite(df_projects, df_models, df_elements, df_properties, outpu
                 df_wide = df_wide[all_columns]
                 save_to_sqlite(df_wide, conn, "properties_wide")
                 total_records += len(df_wide)
-    
+
+    if df_statuses is not None and not df_statuses.empty:
+        save_to_sqlite(df_statuses, conn, "element_status_attributes")
+        total_records += len(df_statuses)
+
     conn.close()
     log_info(f"Создана база SQLite: {db_path} (всего {total_records} записей)")
     return total_records
 
 
-def save_all_to_files(df_projects, df_models, df_elements, df_properties, output_path, selected_properties=None, format_type="csv", include_empty_rows=False):
+def save_all_to_files(df_projects, df_models, df_elements, df_properties, output_path, selected_properties=None, format_type="csv", include_empty_rows=False, df_statuses=None, selected_status_attributes=None):
     if format_type == "sqlite":
-        return save_all_to_sqlite(df_projects, df_models, df_elements, df_properties, output_path, selected_properties, include_empty_rows)
+        return save_all_to_sqlite(
+            df_projects,
+            df_models,
+            df_elements,
+            df_properties,
+            output_path,
+            selected_properties,
+            include_empty_rows,
+            df_statuses=df_statuses,
+            selected_status_attributes=selected_status_attributes,
+        )
     
     os.makedirs(output_path, exist_ok=True)
     
@@ -2081,7 +2397,10 @@ def save_all_to_files(df_projects, df_models, df_elements, df_properties, output
                 df_wide = df_wide[all_columns]
                 save_func(df_wide, output_path, f"properties_wide.{ext}")
                 total_records += len(df_wide)
-    
+
+    if df_statuses is not None and not df_statuses.empty:
+        total_records += save_func(df_statuses, output_path, f"element_status_attributes.{ext}")
+
     log_info(f"Всего записей в {ext.upper()}: {total_records}")
     return total_records
 
@@ -2276,11 +2595,22 @@ def delete_properties_by_model_ids(model_ids, schema="staging", db_config=None):
     )
 
 
+def delete_status_attributes_by_model_ids(model_ids, schema="staging", db_config=None):
+    if not model_ids:
+        return
+    return _delete_rows_by_ids(
+        [f"{schema}.ElementStatusAttributes"],
+        "idModel",
+        model_ids,
+        db_config=db_config,
+    )
+
+
 def delete_data_by_model_ids(model_ids, schema="staging", db_config=None):
     if not model_ids:
         return
     return _delete_rows_by_ids(
-        [f"{schema}.ElementProperties", f"{schema}.ElementPropertiesWide", f"{schema}.Elements", f"{schema}.Models"],
+        [f"{schema}.ElementProperties", f"{schema}.ElementPropertiesWide", f"{schema}.ElementStatusAttributes", f"{schema}.Elements", f"{schema}.Models"],
         "idModel",
         model_ids,
         db_config=db_config,
@@ -2291,7 +2621,7 @@ def delete_data_by_project_ids(project_ids, schema="staging", db_config=None):
     if not project_ids:
         return
     return _delete_rows_by_ids(
-        [f"{schema}.ElementProperties", f"{schema}.ElementPropertiesWide", f"{schema}.Elements", f"{schema}.Models", f"{schema}.Projects"],
+        [f"{schema}.ElementProperties", f"{schema}.ElementPropertiesWide", f"{schema}.ElementStatusAttributes", f"{schema}.Elements", f"{schema}.Models", f"{schema}.Projects"],
         "idProject",
         project_ids,
         db_config=db_config,
@@ -2335,6 +2665,7 @@ def _required_staging_tables(schema="staging"):
         f"{schema}.Elements",
         f"{schema}.ElementProperties",
         f"{schema}.ElementPropertiesWide",
+        f"{schema}.ElementStatusAttributes",
     ]
 
 
@@ -2543,6 +2874,7 @@ def clear_database_tables(schema="staging", db_config=None):
     table_names = [
         f"{schema}.ElementPropertiesWide",
         f"{schema}.ElementProperties",
+        f"{schema}.ElementStatusAttributes",
         f"{schema}.Elements",
         f"{schema}.Models",
         f"{schema}.Projects",
@@ -2745,7 +3077,7 @@ class SyncWorker(QThread):
     error = Signal(str)
     token_expired = Signal()
 
-    def __init__(self, config, projects_df, proj_models, selected_ids, selected_models_per_project=None, selected_properties=None, include_empty_rows=False):
+    def __init__(self, config, projects_df, proj_models, selected_ids, selected_models_per_project=None, selected_properties=None, selected_status_attributes=None, include_empty_rows=False):
         super().__init__()
         self.config = config
         self.projects_df = projects_df
@@ -2753,6 +3085,7 @@ class SyncWorker(QThread):
         self.selected_ids = selected_ids
         self.selected_models_per_project = selected_models_per_project or {}
         self.selected_properties = selected_properties or []
+        self.selected_status_attributes = selected_status_attributes or []
         self.include_empty_rows = include_empty_rows
         self._token_updated = threading.Event()
         self._token_lock = threading.Lock()
@@ -2911,6 +3244,63 @@ class SyncWorker(QThread):
         
         return []
 
+    def _get_status_values_with_retry(self, site, jimc_id, attribute_id):
+        if not attribute_id:
+            return []
+
+        max_retries = 5
+        retry_delay = 3
+
+        for attempt in range(max_retries):
+            if self._cancel_requested:
+                return []
+
+            try:
+                current_token = normalize_token(self.config["token"])
+                url = f"{site}/api/attribute-value/jimcid-attributeid"
+
+                session = get_session()
+                response = session.get(
+                    url,
+                    params={"jimcId": jimc_id, "attributeId": attribute_id},
+                    headers={"Authorization": f"Bearer {current_token}", "Content-Type": "application/json"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+                if response.status_code in (401, 403):
+                    with self._token_lock:
+                        if self._token_dialog_active:
+                            pass
+                        else:
+                            self._token_dialog_active = True
+                            self._token_updated.clear()
+                            self.token_expired.emit()
+
+                    got_token = self._wait_for_token_update()
+
+                    with self._token_lock:
+                        self._token_dialog_active = False
+
+                    if not got_token or self._cancel_requested:
+                        return []
+                    continue
+
+                response.raise_for_status()
+                return _extract_api_items(response.json())
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    log_error(f"Ошибка соединения (попытка {attempt + 1}/{max_retries}), jimc_id={jimc_id}, attribute_id={attribute_id}\n{e}")
+                    time.sleep(retry_delay)
+                else:
+                    log_error(f"Превышено количество попыток для статусов, jimc_id={jimc_id}, attribute_id={attribute_id}")
+                    return []
+            except Exception as e:
+                log_error(f"Ошибка при запросе статусов: {e}")
+                return []
+
+        return []
+
     def run(self):
         global sync_time_str
         start_time = time.time()
@@ -2928,10 +3318,14 @@ class SyncWorker(QThread):
             all_models = []
             all_elements = []
             all_properties = []
+            all_status_attributes = []
             
             load_properties = bool(self.selected_properties)
             if load_properties:
                 log_info(f"Выбрано параметров для выгрузки: {len(self.selected_properties)}")
+            load_statuses = bool(self.selected_status_attributes)
+            if load_statuses:
+                log_info(f"Выбрано статусов для выгрузки: {len(self.selected_status_attributes)}")
 
             project_name_map = dict(zip(self.projects_df["idProject"], self.projects_df["name"]))
             total_projects = len(self.selected_ids)
@@ -3031,7 +3425,39 @@ class SyncWorker(QThread):
                                     elem_count = len(df_elems)
                                     all_elements.append(df_elems)
                                     log_timing(f"API elements {model_name}", elem_start, elem_count)
-                                    
+
+                                    if load_statuses and elem_count > 0:
+                                        status_start = time.time()
+                                        elem_by_nid = {}
+                                        elem_by_eid = {}
+                                        if "el_nid" in df_elems.columns and "el_id" in df_elems.columns:
+                                            for _, row in df_elems[["el_nid", "el_id"]].dropna(subset=["el_nid"]).iterrows():
+                                                try:
+                                                    elem_by_nid[int(row["el_nid"])] = row["el_id"]
+                                                except Exception:
+                                                    continue
+                                        if "el_eid" in df_elems.columns and "el_id" in df_elems.columns:
+                                            for _, row in df_elems[["el_eid", "el_id"]].dropna(subset=["el_eid"]).iterrows():
+                                                try:
+                                                    elem_by_eid[int(row["el_eid"])] = row["el_id"]
+                                                except Exception:
+                                                    continue
+
+                                        status_rows = build_status_attribute_rows(
+                                            df_elems,
+                                            elem_by_nid,
+                                            elem_by_eid,
+                                            self.selected_status_attributes,
+                                            lambda current_jimc_id, attribute_id: self._get_status_values_with_retry(
+                                                self.config["site"], current_jimc_id, attribute_id
+                                            ),
+                                            proj_id,
+                                            jimc_id,
+                                            sync_time_str,
+                                        )
+                                        all_status_attributes.extend(status_rows)
+                                        log_timing(f"API status attributes {model_name}", status_start, len(status_rows))
+                                     
                                     if load_properties and elem_count > 0:
                                         props_start = time.time()
                                         progress_msg = f"Проект {i}/{total_projects} — Модель {j}/{len(models)} — свойства"
@@ -3091,6 +3517,7 @@ class SyncWorker(QThread):
                                                                 "last_updated": sync_time_str
                                                             })
                                                             batch_saved += 1
+
                                                 return batch_idx, None, results, batch_skipped, batch_saved
                                             except Exception as e:
                                                 return batch_idx, e, [], 0, 0
@@ -3119,7 +3546,7 @@ class SyncWorker(QThread):
                                                         all_properties.extend(results)
                                                         props_count += len(results)
                                                         skipped_props += batch_skipped
-                                                
+
                                                 if completed_batches % 5 == 0 or completed_batches == total_batches:
                                                     log_debug(f"Обработано батчей: {completed_batches}/{total_batches}, свойств: {props_count}")
                                         
@@ -3142,8 +3569,9 @@ class SyncWorker(QThread):
             df_models = pd.concat(all_models, ignore_index=True) if all_models else pd.DataFrame()
             df_elements = pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame()
             df_properties = pd.DataFrame(all_properties) if all_properties else pd.DataFrame()
+            df_statuses = pd.DataFrame(all_status_attributes) if all_status_attributes else pd.DataFrame()
 
-            log_info(f"Данные для сохранения: проектов={len(df_projects)}, моделей={len(df_models)}, элементов={len(df_elements)}, свойств={len(df_properties)}")
+            log_info(f"Данные для сохранения: проектов={len(df_projects)}, моделей={len(df_models)}, элементов={len(df_elements)}, свойств={len(df_properties)}, статусов={len(df_statuses)}")
 
             model_ids = df_models["idModel"].dropna().astype(int).unique().tolist() if not df_models.empty else []
 
@@ -3165,6 +3593,9 @@ class SyncWorker(QThread):
             if model_ids:
                 log_debug("Удаление старых свойств для обновляемых моделей...")
                 delete_properties_by_model_ids(model_ids, db_config=self.config)
+                if load_statuses:
+                    log_debug("Удаление старых статусов для обновляемых моделей...")
+                    delete_status_attributes_by_model_ids(model_ids, db_config=self.config)
 
             if not df_properties.empty:
                 t4 = time.time()
@@ -3175,6 +3606,12 @@ class SyncWorker(QThread):
                 log_debug("Сохранение таблицы ElementPropertiesWide...")
                 save_properties_wide_to_sql(all_properties, self.selected_properties, db_config=self.config, include_empty_rows=self.include_empty_rows, df_elements=df_elements)
                 log_timing("SQL INSERT Wide Table", t5, len(df_properties))
+
+            if not df_statuses.empty:
+                t6 = time.time()
+                log_debug("Сохранение таблицы ElementStatusAttributes...")
+                save_status_attributes_to_sql(df_statuses, db_config=self.config)
+                log_timing("SQL INSERT Status Attributes", t6, len(df_statuses))
 
             if not SAVE_EMPTY_PROPERTIES and total_saved_props > 0:
                 log_info(f"ИТОГО свойств: сохранено {total_saved_props}, пропущено пустых {total_skipped_props}")
@@ -3189,6 +3626,7 @@ class SyncWorker(QThread):
                 "models": len(df_models),
                 "elements": len(df_elements),
                 "properties": len(df_properties),
+                "statuses": len(df_statuses),
                 "failed": [],
                 "elapsed": elapsed
             })
@@ -3218,51 +3656,64 @@ class SyncWorker(QThread):
 
 
 class PropertiesSelectDialog(QDialog):
-    """Диалог выбора параметров для выгрузки"""
-    
-    def __init__(self, available_properties, is_dark=False, parent=None):
+    """Диалог выбора параметров и статусов для выгрузки"""
+
+    def __init__(self, available_properties, available_status_attributes=None, is_dark=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Выбор параметров")
-        self.setMinimumSize(600, 500)
+        self.setMinimumSize(760, 560)
         self.setModal(True)
-        
-        self.selected_properties = []
+
         self.is_dark = is_dark
+        self.selected_properties = []
+        self.selected_status_attributes = []
         self.property_checkboxes = {}
-        self._property_rows = []
-        self._property_to_index = {}
-        self._selection_manager = MultiSelectionManager()
-        self._is_handling_checkbox = False
-        self._is_handling_master_checkbox = False
-        
-        self._build_ui(available_properties)
-        
-        if is_dark:
-            self.setStyleSheet(DARK_STYLESHEET)
-        else:
-            self.setStyleSheet(LIGHT_STYLESHEET)
+        self.status_checkboxes = {}
+        self._sections = {}
+
+        self._build_ui(available_properties or [], available_status_attributes or [])
+
+        self.setStyleSheet(DARK_STYLESHEET if is_dark else LIGHT_STYLESHEET)
         set_window_title_bar_dark(self, is_dark)
-    
-    def _build_ui(self, properties):
+
+    def _build_ui(self, available_properties, available_status_attributes):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
-        
-        header = QLabel("Выберите параметры для выгрузки:")
+
+        header = QLabel("Выберите данные для выгрузки:")
         header.setStyleSheet("font-weight: 600; font-size: 12pt;")
         layout.addWidget(header)
-        
-        highlight_frame = QFrame()
-        highlight_frame.setStyleSheet("""
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_properties_tab(available_properties), "Параметры")
+        tabs.addTab(self._build_statuses_tab(available_status_attributes), "Статусы")
+        layout.addWidget(tabs, 1)
+
+        dialog_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        dialog_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("ОК")
+        dialog_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        wire_dialog_button_box(dialog_buttons, self.accept, self.reject)
+        layout.addWidget(dialog_buttons)
+
+    def _build_properties_tab(self, properties):
+        section = self._create_section_state("properties", len(properties), "параметров")
+        self._sections["properties"] = section
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        hint_frame = QFrame()
+        hint_frame.setStyleSheet("""
             QFrame {
                 border: 1px solid #FF8C00;
                 border-radius: 4px;
                 padding: 4px;
             }
         """)
-        highlight_layout = QHBoxLayout(highlight_frame)
-        highlight_layout.setContentsMargins(8, 4, 8, 4)
-        
+        hint_layout = QHBoxLayout(hint_frame)
+        hint_layout.setContentsMargins(8, 4, 8, 4)
         self.include_empty_checkbox = QCheckBox("Выгрузить пустые элементы")
         self.include_empty_checkbox.setToolTip(
             "Если отмечено: в properties_wide попадут ВСЕ элементы, включая те,\n"
@@ -3270,142 +3721,192 @@ class PropertiesSelectDialog(QDialog):
             "Если снято (по умолчанию): только элементы хотя бы с одним заполненным параметром."
         )
         self.include_empty_checkbox.setStyleSheet("font-weight: bold;")
-        highlight_layout.addWidget(self.include_empty_checkbox)
-        layout.addWidget(highlight_frame)
-        
+        hint_layout.addWidget(self.include_empty_checkbox)
+        layout.addWidget(hint_frame)
+
+        self._add_search_row(layout, section, "Введите текст для поиска параметров...")
+        self._add_header_row(layout, section, "Наименование параметров")
+        self._add_scroll_list(layout, section, properties, lambda prop: prop, lambda prop: prop, "property")
+        layout.addWidget(section["count_label"])
+        return root
+
+    def _build_statuses_tab(self, statuses):
+        section = self._create_section_state("statuses", len(statuses), "статусов")
+        self._sections["statuses"] = section
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._add_search_row(layout, section, "Введите текст для поиска статусов...")
+        self._add_header_row(layout, section, "Наименование статусов")
+        self._add_scroll_list(
+            layout,
+            section,
+            statuses,
+            lambda item: f"{item.get('schemaTitle', '')} / {item.get('attributeTitle', '')}".strip(" /"),
+            lambda item: (item.get("schemaId"), item.get("attributeId")),
+            "status",
+        )
+        layout.addWidget(section["count_label"])
+        return root
+
+    def _create_section_state(self, section_key, total_count, label_suffix):
+        section = {
+            "key": section_key,
+            "total_count": total_count,
+            "label_suffix": label_suffix,
+            "items": [],
+            "labels": {},
+            "checkboxes": {},
+            "rows": [],
+            "index_map": {},
+            "selection_manager": MultiSelectionManager(),
+            "is_handling_checkbox": False,
+            "is_handling_master_checkbox": False,
+        }
+        section["count_label"] = QLabel(f"Выбрано {label_suffix}: 0")
+        return section
+
+    def _add_search_row(self, layout, section, placeholder):
         search_layout = QHBoxLayout()
         search_label = QLabel("Поиск:")
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Введите текст для поиска...")
-        self.search_edit.textChanged.connect(self._filter_properties)
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText(placeholder)
+        search_edit.textChanged.connect(lambda text, key=section["key"]: self._filter_section(key, text))
         search_layout.addWidget(search_label)
-        search_layout.addWidget(self.search_edit)
+        search_layout.addWidget(search_edit)
         layout.addLayout(search_layout)
-        
+        section["search_edit"] = search_edit
+
+    def _add_header_row(self, layout, section, header_text):
         header_row = QFrame()
         header_row.setStyleSheet("QFrame { background: transparent; border: none; }")
         header_layout = QHBoxLayout(header_row)
         header_layout.setContentsMargins(9, 2, 4, 2)
         header_layout.setSpacing(4)
-        
-        self.master_checkbox = HeaderSelectAllCheckBox()
-        self.master_checkbox.setStyleSheet("background: transparent;")
-        self.master_checkbox.stateChanged.connect(self._on_master_checkbox_changed)
-        header_layout.addWidget(self.master_checkbox)
-        
-        header_label = QLabel("Наименование параметров")
+
+        master_checkbox = HeaderSelectAllCheckBox()
+        master_checkbox.setStyleSheet("background: transparent;")
+        master_checkbox.stateChanged.connect(lambda state, key=section["key"]: self._on_master_checkbox_changed(key, state))
+        header_layout.addWidget(master_checkbox)
+
+        header_label = QLabel(header_text)
         header_label.setStyleSheet("font-weight: 600; background: transparent;")
         header_layout.addWidget(header_label)
         header_layout.addStretch()
-        
         layout.addWidget(header_row)
-        
+        section["master_checkbox"] = master_checkbox
+
+    def _add_scroll_list(self, layout, section, items, display_func, key_func, kind):
         scroll = QScrollArea()
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        
-        self.properties_container = QWidget()
-        self.properties_layout = QVBoxLayout(self.properties_container)
-        self.properties_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.properties_layout.setSpacing(2)
-        self.properties_layout.setContentsMargins(4, 4, 4, 4)
-        
-        for idx, prop in enumerate(sorted(properties)):
-            cb = IndicatorOnlyCheckBox(prop)
-            cb.setProperty("property_path", prop)
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        container_layout.setSpacing(2)
+        container_layout.setContentsMargins(4, 4, 4, 4)
+
+        sorted_items = sorted(items, key=lambda item: display_func(item).lower())
+        for idx, item in enumerate(sorted_items):
+            item_key = key_func(item)
+            label_text = display_func(item)
+            cb = IndicatorOnlyCheckBox(label_text)
             cb.setStyleSheet("background: transparent;")
-            cb.stateChanged.connect(lambda state, p=prop: self._on_checkbox_state_changed(p, state))
-            cb.row_click_requested.connect(lambda modifiers, row_index=idx: self._on_property_row_area_clicked(row_index, modifiers))
-            
+            cb.stateChanged.connect(lambda state, key=section["key"], item_key=item_key: self._on_checkbox_state_changed(key, item_key, state))
+            cb.row_click_requested.connect(lambda modifiers, row_index=idx, key=section["key"]: self._on_row_area_clicked(key, row_index, modifiers))
+
             row_widget = SelectableRowWidget(cb, idx, is_dark=self.is_dark)
-            row_widget.row_clicked.connect(self._on_row_clicked)
-            self.properties_layout.addWidget(row_widget)
-            
-            self.property_checkboxes[prop] = cb
-            self._property_to_index[prop] = idx
-            self._property_rows.append(row_widget)
-        
-        self._selection_manager.set_items(self._property_rows)
-        self._update_master_checkbox_state()
-        
-        scroll.setWidget(self.properties_container)
+            row_widget.row_clicked.connect(lambda row_widget, event, key=section["key"]: self._on_row_clicked(key, row_widget, event))
+            container_layout.addWidget(row_widget)
+
+            section["checkboxes"][item_key] = cb
+            section["rows"].append(row_widget)
+            section["index_map"][item_key] = idx
+            section["items"].append(item)
+            section["labels"][item_key] = label_text
+
+            if kind == "property":
+                self.property_checkboxes[item_key] = cb
+            else:
+                self.status_checkboxes[item_key] = cb
+
+        section["selection_manager"].set_items(section["rows"])
+        scroll.setWidget(container)
         layout.addWidget(scroll, 1)
-        
-        self.count_label = QLabel(f"Выбрано: 0 из {len(properties)}")
-        layout.addWidget(self.count_label)
-        
-        dialog_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        dialog_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("ОК")
-        dialog_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        wire_dialog_button_box(dialog_buttons, self.accept, self.reject)
-        layout.addWidget(dialog_buttons)
-    
-    def _on_row_clicked(self, row_widget, event):
-        index = row_widget.get_index()
-        modifiers = event.modifiers()
-        
-        self._selection_manager.handle_click(index, modifiers, len(self._property_rows))
-        self._update_row_selections()
-    
-    def _on_property_row_area_clicked(self, index, modifiers):
-        self._selection_manager.handle_click(index, modifiers, len(self._property_rows))
-        self._update_row_selections()
-    
-    def _update_row_selections(self):
-        for idx, row in enumerate(self._property_rows):
-            row.set_selected(self._selection_manager.is_selected(idx))
-    
-    def _on_checkbox_state_changed(self, prop, state):
-        if self._is_handling_checkbox:
+        section["scroll"] = scroll
+        section["container"] = container
+        section["container_layout"] = container_layout
+        self._update_master_checkbox_state(section["key"])
+        self._update_count(section["key"])
+
+    def _on_row_clicked(self, section_key, row_widget, event):
+        section = self._sections[section_key]
+        section["selection_manager"].handle_click(row_widget.get_index(), event.modifiers(), len(section["rows"]))
+        self._update_row_selections(section_key)
+
+    def _on_row_area_clicked(self, section_key, index, modifiers):
+        section = self._sections[section_key]
+        section["selection_manager"].handle_click(index, modifiers, len(section["rows"]))
+        self._update_row_selections(section_key)
+
+    def _update_row_selections(self, section_key):
+        section = self._sections[section_key]
+        for idx, row in enumerate(section["rows"]):
+            row.set_selected(section["selection_manager"].is_selected(idx))
+
+    def _on_checkbox_state_changed(self, section_key, item_key, state):
+        section = self._sections[section_key]
+        if section["is_handling_checkbox"]:
             return
-        
-        clicked_index = self._property_to_index.get(prop)
+
+        clicked_index = section["index_map"].get(item_key)
         if clicked_index is None:
-            self._update_count()
+            self._update_count(section_key)
             return
-        
-        selected_indices = self._selection_manager.get_selected_indices()
-        is_clicked_selected = clicked_index in selected_indices
-        selected_count = len(selected_indices)
-        
-        if is_clicked_selected and selected_count > 1:
-            self._is_handling_checkbox = True
+
+        selected_indices = section["selection_manager"].get_selected_indices()
+        if clicked_index in selected_indices and len(selected_indices) > 1:
+            section["is_handling_checkbox"] = True
             try:
                 is_checked = (state == Qt.CheckState.Checked.value)
                 for sel_idx in selected_indices:
-                    if sel_idx < len(self._property_rows):
-                        row_widget = self._property_rows[sel_idx]
+                    if sel_idx < len(section["rows"]):
+                        row_widget = section["rows"][sel_idx]
                         cb = row_widget._content_widget
                         if cb.isEnabled():
                             cb.blockSignals(True)
                             cb.setChecked(is_checked)
                             cb.blockSignals(False)
             finally:
-                self._is_handling_checkbox = False
-        
-        self._update_count()
-    
-    def _filter_properties(self, text):
-        text = text.lower()
-        for prop, cb in self.property_checkboxes.items():
-            visible = text in prop.lower()
-            idx = self._property_to_index.get(prop)
-            if idx is not None and idx < len(self._property_rows):
-                self._property_rows[idx].setVisible(visible)
-        self._update_master_checkbox_state()
-    
-    def _on_master_checkbox_changed(self, state):
-        if self._is_handling_master_checkbox:
+                section["is_handling_checkbox"] = False
+
+        self._update_count(section_key)
+
+    def _filter_section(self, section_key, text):
+        section = self._sections[section_key]
+        text = text.lower().strip()
+        for item_key, label in section["labels"].items():
+            visible = text in label.lower()
+            idx = section["index_map"].get(item_key)
+            if idx is not None and idx < len(section["rows"]):
+                section["rows"][idx].setVisible(visible)
+        self._update_master_checkbox_state(section_key)
+
+    def _on_master_checkbox_changed(self, section_key, state):
+        section = self._sections[section_key]
+        if section["is_handling_master_checkbox"]:
             return
-        
         if state == Qt.CheckState.PartiallyChecked.value:
             return
-        
+
         is_checked = (state == Qt.CheckState.Checked.value)
-        self._is_handling_master_checkbox = True
+        section["is_handling_master_checkbox"] = True
         try:
-            for idx, row in enumerate(self._property_rows):
+            for row in section["rows"]:
                 if row.isVisible():
                     cb = row._content_widget
                     if cb.isEnabled():
@@ -3413,42 +3914,57 @@ class PropertiesSelectDialog(QDialog):
                         cb.setChecked(is_checked)
                         cb.blockSignals(False)
         finally:
-            self._is_handling_master_checkbox = False
-        
-        self._update_count()
-    
-    def _update_master_checkbox_state(self):
-        if self._is_handling_master_checkbox:
+            section["is_handling_master_checkbox"] = False
+
+        self._update_count(section_key)
+
+    def _update_master_checkbox_state(self, section_key):
+        section = self._sections[section_key]
+        if section["is_handling_master_checkbox"]:
             return
-        
+
         visible_count = 0
         checked_count = 0
-        for idx, row in enumerate(self._property_rows):
+        for row in section["rows"]:
             if row.isVisible():
                 visible_count += 1
-                cb = row._content_widget
-                if cb.isChecked():
+                if row._content_widget.isChecked():
                     checked_count += 1
-        
-        self._is_handling_master_checkbox = True
+
+        section["is_handling_master_checkbox"] = True
         try:
             if visible_count == 0 or checked_count == 0:
-                self.master_checkbox.setCheckState(Qt.CheckState.Unchecked)
+                section["master_checkbox"].setCheckState(Qt.CheckState.Unchecked)
             elif checked_count == visible_count:
-                self.master_checkbox.setCheckState(Qt.CheckState.Checked)
+                section["master_checkbox"].setCheckState(Qt.CheckState.Checked)
             else:
-                self.master_checkbox.setCheckState(Qt.CheckState.PartiallyChecked)
+                section["master_checkbox"].setCheckState(Qt.CheckState.PartiallyChecked)
         finally:
-            self._is_handling_master_checkbox = False
-    
-    def _update_count(self):
-        count = sum(1 for cb in self.property_checkboxes.values() if cb.isChecked())
-        self.count_label.setText(f"Выбрано: {count} из {len(self.property_checkboxes)}")
-        self._update_master_checkbox_state()
-    
+            section["is_handling_master_checkbox"] = False
+
+    def _update_count(self, section_key):
+        section = self._sections[section_key]
+        count = sum(1 for cb in section["checkboxes"].values() if cb.isChecked())
+        section["count_label"].setText(f"Выбрано {section['label_suffix']}: {count}")
+        self._update_master_checkbox_state(section_key)
+
     def get_selected_properties(self):
         return [prop for prop, cb in self.property_checkboxes.items() if cb.isChecked()]
-    
+
+    def get_selected_status_attributes(self):
+        selected = []
+        for item in self._sections.get("statuses", {}).get("items", []):
+            key = (item.get("schemaId"), item.get("attributeId"))
+            cb = self.status_checkboxes.get(key)
+            if cb and cb.isChecked():
+                selected.append({
+                    "schemaId": item.get("schemaId"),
+                    "schemaTitle": item.get("schemaTitle", ""),
+                    "attributeId": item.get("attributeId"),
+                    "attributeTitle": item.get("attributeTitle", ""),
+                })
+        return selected
+
     def get_include_empty_rows(self):
         return self.include_empty_checkbox.isChecked()
 
@@ -5170,24 +5686,24 @@ class BimSyncWindow(QMainWindow):
                 log_info(f"Проект {proj_id}: выбраны все модели")
 
         reply = self._question_yes_no_cancel(
-            "Загрузка свойств",
-            "Загрузить свойства элементов?\n\n"
-            "Это позволит выгрузить дополнительные параметры (например, размеры, отметки и т.д.)\n"
-            "в отдельную таблицу ElementProperties."
+            "Загрузка свойств и статусов",
+            "Загрузить параметры и статусы элементов?\n\n"
+            "Это позволит выгрузить дополнительные свойства и Viewer-статусы в отдельные таблицы."
         )
         
         if reply == "cancel":
             return
         
         props_to_load = []
+        status_attrs_to_load = []
         include_empty_rows = False
         if reply == "yes":
             self.btn_sync.setEnabled(False)
-            self.progress_label.setText("Сбор доступных параметров...")
+            self.progress_label.setText("Сбор доступных параметров и статусов...")
             self.progress_bar.setIndeterminate(True)
             QApplication.processEvents()
             
-            all_properties = self._collect_all_properties(selected_project_ids, selected_models_per_project)
+            all_properties, all_status_attributes = self._collect_all_properties(selected_project_ids, selected_models_per_project)
             
             self.progress_bar.setIndeterminate(False)
             self.progress_bar.setValue(0)
@@ -5195,32 +5711,42 @@ class BimSyncWindow(QMainWindow):
             self.btn_sync.setEnabled(True)
             QApplication.processEvents()
             
-            if not all_properties:
-                self._show_warning("Внимание", "Не удалось получить список параметров. Возможно, элементы пусты или ошибка соединения.")
+            if not all_properties and not all_status_attributes:
+                self._show_warning("Внимание", "Не удалось получить список параметров и статусов. Возможно, элементы пусты или ошибка соединения.")
                 return
             
-            dialog = PropertiesSelectDialog(all_properties, self.is_dark_theme, self)
+            dialog = PropertiesSelectDialog(all_properties, all_status_attributes, self.is_dark_theme, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             
             props_to_load = dialog.get_selected_properties()
+            status_attrs_to_load = dialog.get_selected_status_attributes()
             include_empty_rows = dialog.get_include_empty_rows()
-            if not props_to_load:
+            if not props_to_load and not status_attrs_to_load:
                 cont = self._question_yes_no(
                     "Подтверждение",
-                    "Не выбрано ни одного параметра. Продолжить без загрузки свойств?"
+                    "Не выбрано ни одного параметра или статуса. Продолжить без загрузки свойств и статусов?"
                 )
                 if cont != "yes":
                     return
             
-            log_info(f"Будут загружены свойства: {len(props_to_load)} параметров")
+            log_info(f"Будут загружены данные: параметров={len(props_to_load)}, статусов={len(status_attrs_to_load)}")
 
         self.btn_sync.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_label.setText("Готово: 0%")
         self.btn_cancel.setVisible(True)
 
-        self.worker = SyncWorker(CONFIG, df_all_projects, project_models, selected_project_ids, selected_models_per_project, props_to_load, include_empty_rows)
+        self.worker = SyncWorker(
+            CONFIG,
+            df_all_projects,
+            project_models,
+            selected_project_ids,
+            selected_models_per_project,
+            props_to_load,
+            status_attrs_to_load,
+            include_empty_rows,
+        )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
@@ -5228,9 +5754,10 @@ class BimSyncWindow(QMainWindow):
         self.worker.start()
 
     def _collect_all_properties(self, selected_project_ids, selected_models_per_project):
-        """Сбор всех уникальных параметров из выбранных моделей"""
+        """Сбор всех уникальных параметров и статусов из выбранных моделей"""
         global CONFIG
         all_properties = set()
+        all_status_attributes = {}
         
         total_models = 0
         for proj_id in selected_project_ids:
@@ -5242,7 +5769,7 @@ class BimSyncWindow(QMainWindow):
                 total_models += len(all_models_list)
         
         if total_models == 0:
-            return []
+            return [], []
         
         self.progress_bar.setIndeterminate(False)
         processed = 0
@@ -5271,6 +5798,10 @@ class BimSyncWindow(QMainWindow):
                     props = get_sample_properties(CONFIG["site"], CONFIG["token"], jimc_id)
                     for p in props:
                         all_properties.add(p)
+                    status_attrs = get_sample_status_attributes(CONFIG["site"], CONFIG["token"], proj_id, jimc_id)
+                    for item in status_attrs:
+                        key = (item.get("schemaId"), item.get("attributeId"))
+                        all_status_attributes[key] = item
                 except TokenExpiredError:
                     while True:
                         dialog = QDialog(self)
@@ -5344,12 +5875,28 @@ class BimSyncWindow(QMainWindow):
                                 log_info("Токен обновлён, продолжение сбора параметров")
                                 break
                         else:
-                            return list(all_properties)
+                            return sorted(list(all_properties)), sorted(
+                                list(all_status_attributes.values()),
+                                key=lambda item: (
+                                    item.get("schemaTitle", "").lower(),
+                                    item.get("attributeTitle", "").lower(),
+                                    item.get("schemaId", 0),
+                                    item.get("attributeId", 0),
+                                ),
+                            )
                 except Exception as e:
                     log_debug(f"Ошибка получения параметров из модели {jimc_id}: {e}")
                     continue
-        
-        return sorted(list(all_properties))
+
+        return sorted(list(all_properties)), sorted(
+            list(all_status_attributes.values()),
+            key=lambda item: (
+                item.get("schemaTitle", "").lower(),
+                item.get("attributeTitle", "").lower(),
+                item.get("schemaId", 0),
+                item.get("attributeId", 0),
+            ),
+        )
 
     def _on_token_expired(self):
         self._set_status_icon(self.api_status_icon, False)
@@ -5690,6 +6237,7 @@ class BimSyncWindow(QMainWindow):
 
         failed = result.get('failed', [])
         props_count = result.get('properties', 0)
+        statuses_count = result.get('statuses', 0)
         elapsed = result.get('elapsed', 0)
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
@@ -5705,6 +6253,8 @@ class BimSyncWindow(QMainWindow):
             )
             if props_count > 0:
                 msg += f"Свойств: {props_count}\n"
+            if statuses_count > 0:
+                msg += f"Статусов: {statuses_count}\n"
             msg += f"\nНе удалось загрузить {len(failed)} моделей.\nПодробности в {LOG_FILE}"
             self._show_warning("Завершено с ошибками", msg)
         else:
@@ -5716,6 +6266,8 @@ class BimSyncWindow(QMainWindow):
             )
             if props_count > 0:
                 msg += f"Свойств: {props_count}\n"
+            if statuses_count > 0:
+                msg += f"Статусов: {statuses_count}\n"
             msg += f"\nВремя: {time_str}\nЛог: {LOG_FILE}"
             self._show_info("Готово", msg)
 
@@ -6681,23 +7233,24 @@ class PowerBiExportWindow(QMainWindow):
             return
         
         reply = self._question_yes_no_cancel(
-            "Загрузка свойств",
-            "Загрузить свойства элементов?\n\n"
-            "Это позволит выгрузить дополнительные параметры в отдельные файлы."
+            "Загрузка свойств и статусов",
+            "Загрузить параметры и статусы элементов?\n\n"
+            "Это позволит выгрузить дополнительные свойства и Viewer-статусы в отдельные файлы."
         )
         
         if reply == "cancel":
             return
         
         props_to_load = []
+        status_attrs_to_load = []
         include_empty_rows = False
         if reply == "yes":
             self.btn_sync.setEnabled(False)
-            self.progress_label.setText("Сбор доступных параметров...")
+            self.progress_label.setText("Сбор доступных параметров и статусов...")
             self.progress_bar.setIndeterminate(True)
             QApplication.processEvents()
             
-            all_properties = self._collect_all_properties(selected_project_ids, selected_models_per_project)
+            all_properties, all_status_attributes = self._collect_all_properties(selected_project_ids, selected_models_per_project)
             
             self.progress_bar.setIndeterminate(False)
             self.progress_bar.setValue(0)
@@ -6705,15 +7258,16 @@ class PowerBiExportWindow(QMainWindow):
             self.btn_sync.setEnabled(True)
             QApplication.processEvents()
             
-            if not all_properties:
-                self._show_warning("Внимание", "Не удалось получить список параметров.")
+            if not all_properties and not all_status_attributes:
+                self._show_warning("Внимание", "Не удалось получить список параметров и статусов.")
                 return
             
-            dialog = PropertiesSelectDialog(all_properties, self.is_dark_theme, self)
+            dialog = PropertiesSelectDialog(all_properties, all_status_attributes, self.is_dark_theme, self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             
             props_to_load = dialog.get_selected_properties()
+            status_attrs_to_load = dialog.get_selected_status_attributes()
             include_empty_rows = dialog.get_include_empty_rows()
         
         self.btn_sync.setEnabled(False)
@@ -6723,7 +7277,7 @@ class PowerBiExportWindow(QMainWindow):
         self.worker = PowerBiSyncWorker(
             CONFIG, df_all_projects, project_models, 
             selected_project_ids, selected_models_per_project, 
-            props_to_load, output_path, self.format_type, include_empty_rows
+            props_to_load, status_attrs_to_load, output_path, self.format_type, include_empty_rows
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
@@ -6734,6 +7288,7 @@ class PowerBiExportWindow(QMainWindow):
     def _collect_all_properties(self, selected_project_ids, selected_models_per_project):
         global CONFIG
         all_properties = set()
+        all_status_attributes = {}
         
         total_models = 0
         for proj_id in selected_project_ids:
@@ -6745,7 +7300,7 @@ class PowerBiExportWindow(QMainWindow):
                 total_models += len(all_models_list)
         
         if total_models == 0:
-            return []
+            return [], []
         
         self.progress_bar.setIndeterminate(False)
         processed = 0
@@ -6774,13 +7329,25 @@ class PowerBiExportWindow(QMainWindow):
                     props = get_sample_properties(CONFIG["site"], CONFIG["token"], jimc_id)
                     for p in props:
                         all_properties.add(p)
+                    status_attrs = get_sample_status_attributes(CONFIG["site"], CONFIG["token"], proj_id, jimc_id)
+                    for item in status_attrs:
+                        key = (item.get("schemaId"), item.get("attributeId"))
+                        all_status_attributes[key] = item
                 except TokenExpiredError:
                     pass
                 except Exception as e:
                     log_debug(f"Ошибка получения параметров из модели {jimc_id}: {e}")
                     continue
-        
-        return sorted(list(all_properties))
+
+        return sorted(list(all_properties)), sorted(
+            list(all_status_attributes.values()),
+            key=lambda item: (
+                item.get("schemaTitle", "").lower(),
+                item.get("attributeTitle", "").lower(),
+                item.get("schemaId", 0),
+                item.get("attributeId", 0),
+            ),
+        )
     
     def _on_token_expired(self):
         dialog = QDialog(self)
@@ -6835,6 +7402,7 @@ class PowerBiExportWindow(QMainWindow):
         self.btn_sync.setEnabled(True)
         
         props_count = result.get('properties', 0)
+        statuses_count = result.get('statuses', 0)
         elapsed = result.get('elapsed', 0)
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
@@ -6849,6 +7417,8 @@ class PowerBiExportWindow(QMainWindow):
         )
         if props_count > 0:
             msg += f"Свойств: {props_count}\n"
+        if statuses_count > 0:
+            msg += f"Статусов: {statuses_count}\n"
         msg += f"\nПапка: {output_path}\nВремя: {time_str}"
         self._show_info("Готово", msg)
     
@@ -6884,7 +7454,7 @@ class PowerBiSyncWorker(QThread):
     error = Signal(str)
     token_expired = Signal()
 
-    def __init__(self, config, projects_df, proj_models, selected_ids, selected_models_per_project=None, selected_properties=None, output_path=None, format_type="csv", include_empty_rows=False):
+    def __init__(self, config, projects_df, proj_models, selected_ids, selected_models_per_project=None, selected_properties=None, selected_status_attributes=None, output_path=None, format_type="csv", include_empty_rows=False):
         super().__init__()
         self.config = config
         self.projects_df = projects_df
@@ -6892,6 +7462,7 @@ class PowerBiSyncWorker(QThread):
         self.selected_ids = selected_ids
         self.selected_models_per_project = selected_models_per_project or {}
         self.selected_properties = selected_properties or []
+        self.selected_status_attributes = selected_status_attributes or []
         self.output_path = output_path
         self.format_type = format_type
         self.include_empty_rows = include_empty_rows
@@ -7035,6 +7606,59 @@ class PowerBiSyncWorker(QThread):
         
         return []
 
+    def _get_status_values_with_retry(self, site, jimc_id, attribute_id):
+        if not attribute_id:
+            return []
+
+        max_retries = 5
+        retry_delay = 3
+
+        for attempt in range(max_retries):
+            if self._cancel_requested:
+                return []
+
+            try:
+                current_token = normalize_token(self.config["token"])
+                url = f"{site}/api/attribute-value/jimcid-attributeid"
+
+                session = get_session()
+                response = session.get(
+                    url,
+                    params={"jimcId": jimc_id, "attributeId": attribute_id},
+                    headers={"Authorization": f"Bearer {current_token}", "Content-Type": "application/json"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+                if response.status_code in (401, 403):
+                    with self._token_lock:
+                        if not self._token_dialog_active:
+                            self._token_dialog_active = True
+                            self._token_updated.clear()
+                            self.token_expired.emit()
+
+                    got_token = self._wait_for_token_update()
+
+                    with self._token_lock:
+                        self._token_dialog_active = False
+
+                    if not got_token or self._cancel_requested:
+                        return []
+                    continue
+
+                response.raise_for_status()
+                return _extract_api_items(response.json())
+
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    return []
+            except Exception as e:
+                log_error(f"Ошибка при запросе статусов: {e}")
+                return []
+
+        return []
+
     def run(self):
         start_time = time.time()
         try:
@@ -7051,10 +7675,14 @@ class PowerBiSyncWorker(QThread):
             all_models = []
             all_elements = []
             all_properties = []
+            all_status_attributes = []
             
             load_properties = bool(self.selected_properties)
             if load_properties:
                 log_info(f"Выбрано параметров для выгрузки: {len(self.selected_properties)}")
+            load_statuses = bool(self.selected_status_attributes)
+            if load_statuses:
+                log_info(f"Выбрано статусов для выгрузки: {len(self.selected_status_attributes)}")
 
             project_name_map = dict(zip(self.projects_df["idProject"], self.projects_df["name"]))
             total_projects = len(self.selected_ids)
@@ -7143,7 +7771,39 @@ class PowerBiSyncWorker(QThread):
                                     elem_count = len(df_elems)
                                     all_elements.append(df_elems)
                                     log_timing(f"API elements {model_name}", elem_start, elem_count)
-                                    
+
+                                    if load_statuses and elem_count > 0:
+                                        status_start = time.time()
+                                        elem_by_nid = {}
+                                        elem_by_eid = {}
+                                        if "el_nid" in df_elems.columns and "el_id" in df_elems.columns:
+                                            for _, row in df_elems[["el_nid", "el_id"]].dropna(subset=["el_nid"]).iterrows():
+                                                try:
+                                                    elem_by_nid[int(row["el_nid"])] = row["el_id"]
+                                                except Exception:
+                                                    continue
+                                        if "el_eid" in df_elems.columns and "el_id" in df_elems.columns:
+                                            for _, row in df_elems[["el_eid", "el_id"]].dropna(subset=["el_eid"]).iterrows():
+                                                try:
+                                                    elem_by_eid[int(row["el_eid"])] = row["el_id"]
+                                                except Exception:
+                                                    continue
+
+                                        status_rows = build_status_attribute_rows(
+                                            df_elems,
+                                            elem_by_nid,
+                                            elem_by_eid,
+                                            self.selected_status_attributes,
+                                            lambda current_jimc_id, attribute_id: self._get_status_values_with_retry(
+                                                self.config["site"], current_jimc_id, attribute_id
+                                            ),
+                                            proj_id,
+                                            jimc_id,
+                                            sync_time_str,
+                                        )
+                                        all_status_attributes.extend(status_rows)
+                                        log_timing(f"API status attributes {model_name}", status_start, len(status_rows))
+                                     
                                     if load_properties and elem_count > 0:
                                         props_start = time.time()
                                         
@@ -7199,6 +7859,7 @@ class PowerBiSyncWorker(QThread):
                                                                 "last_updated": sync_time_str
                                                             })
                                                             batch_saved += 1
+
                                                 return batch_idx, None, results, batch_skipped, batch_saved
                                             except Exception as e:
                                                 return batch_idx, e, [], 0, 0
@@ -7226,7 +7887,7 @@ class PowerBiSyncWorker(QThread):
                                                         all_properties.extend(results)
                                                         props_count += len(results)
                                                         skipped_props += batch_skipped
-                                        
+
                                         log_timing(f"API properties {model_name}", props_start, props_count)
                                         if not SAVE_EMPTY_PROPERTIES:
                                             log_info(f"Фильтрация пустых значений: сохранено {props_count}, пропущено {skipped_props}")
@@ -7244,11 +7905,23 @@ class PowerBiSyncWorker(QThread):
             df_models = pd.concat(all_models, ignore_index=True) if all_models else pd.DataFrame()
             df_elements = pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame()
             df_properties = pd.DataFrame(all_properties) if all_properties else pd.DataFrame()
+            df_statuses = pd.DataFrame(all_status_attributes) if all_status_attributes else pd.DataFrame()
 
-            log_info(f"Данные для сохранения: проектов={len(df_projects)}, моделей={len(df_models)}, элементов={len(df_elements)}, свойств={len(df_properties)}")
+            log_info(f"Данные для сохранения: проектов={len(df_projects)}, моделей={len(df_models)}, элементов={len(df_elements)}, свойств={len(df_properties)}, статусов={len(df_statuses)}")
 
             t_save = time.time()
-            save_all_to_files(df_projects, df_models, df_elements, df_properties, self.output_path, self.selected_properties, self.format_type, self.include_empty_rows)
+            save_all_to_files(
+                df_projects,
+                df_models,
+                df_elements,
+                df_properties,
+                self.output_path,
+                self.selected_properties,
+                self.format_type,
+                self.include_empty_rows,
+                df_statuses=df_statuses,
+                selected_status_attributes=self.selected_status_attributes,
+            )
             log_timing(f"{self.format_type.upper()} save", t_save, len(df_projects) + len(df_models) + len(df_elements) + len(df_properties))
 
             if not SAVE_EMPTY_PROPERTIES and total_saved_props > 0:
@@ -7262,6 +7935,7 @@ class PowerBiSyncWorker(QThread):
                 "models": len(df_models),
                 "elements": len(df_elements),
                 "properties": len(df_properties),
+                "statuses": len(df_statuses),
                 "failed": [],
                 "elapsed": elapsed,
                 "output_path": self.output_path

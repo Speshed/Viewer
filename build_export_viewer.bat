@@ -9,15 +9,16 @@ pushd "%PROJECT_DIR%" >nul || (
     exit /b 1
 )
 
-set "EXPORT_VIEWER_SCRIPT=%PROJECT_DIR%\export_viewer_main.py"
-set "EXPORT_VIEWER_NAME=Larix_Export_Viewer"
+set "ENTRY_SCRIPT_NAME=export_viewer_main.py"
+set "ENTRY_SCRIPT=%PROJECT_DIR%\%ENTRY_SCRIPT_NAME%"
+set "APP_NAME=Larix_Export_Viewer"
 set "ICON_FILE=%PROJECT_DIR%\icon\logo.ico"
 set "DIST_DIR=%PROJECT_DIR%\dist"
 set "BUILD_DIR=%PROJECT_DIR%\build"
 set "SPEC_DIR=%PROJECT_DIR%"
 
-if not exist "%EXPORT_VIEWER_SCRIPT%" (
-    echo [ERROR] Entry script not found: "%EXPORT_VIEWER_SCRIPT%"
+if not exist "%ENTRY_SCRIPT%" (
+    echo [ERROR] Entry script not found: %ENTRY_SCRIPT_NAME%
     popd >nul
     exit /b 1
 )
@@ -51,35 +52,26 @@ set "PYARROW_ARGS="
 py -3 -c "import pyarrow" >nul 2>&1
 if not errorlevel 1 (
     set "PYARROW_ARGS=--collect-binaries pyarrow --collect-data pyarrow --hidden-import pyarrow --hidden-import pyarrow.lib --hidden-import pyarrow.compute --hidden-import pyarrow._compute --hidden-import pyarrow.parquet --hidden-import pyarrow._parquet --hidden-import pyarrow.dataset --hidden-import pyarrow._dataset --hidden-import pyarrow._dataset_parquet --hidden-import pyarrow.fs --hidden-import pyarrow._fs --hidden-import pyarrow.pandas_compat"
-)
-if errorlevel 1 (
+) else (
     echo [WARN] pyarrow was not found.
     echo [WARN] The built EXE will work, but Parquet export in BIM Sync mode will be unavailable.
 )
 
-set "COMMON_ARGS=--noconfirm --clean --onefile --windowed --distpath "%DIST_DIR%" --specpath "%SPEC_DIR%" --paths "%PROJECT_DIR%\Viewer" --paths "%PROJECT_DIR%\Sync" --paths "%PROJECT_DIR%\shared" --add-data "%PROJECT_DIR%\Viewer;Viewer" --add-data "%PROJECT_DIR%\Sync;Sync" --add-data "%PROJECT_DIR%\shared;shared" --add-data "%PROJECT_DIR%\icon;icon" --hidden-import pyodbc --hidden-import tenacity --hidden-import pandas --hidden-import requests --hidden-import openpyxl --collect-binaries pyodbc --collect-data certifi %PYARROW_ARGS%"
+set "COMMON_ARGS=--noconfirm --clean --onefile --windowed --distpath "%DIST_DIR%" --specpath "%SPEC_DIR%" --paths "%PROJECT_DIR%\Sync" --paths "%PROJECT_DIR%\shared" --add-data "%PROJECT_DIR%\Sync;Sync" --add-data "%PROJECT_DIR%\shared;shared" --add-data "%PROJECT_DIR%\icon;icon" --hidden-import pyodbc --hidden-import tenacity --hidden-import pandas --hidden-import requests --hidden-import openpyxl --collect-data certifi --collect-binaries pyodbc %PYARROW_ARGS%"
 
-rem --- Clean previous builds ---
-if exist "%DIST_DIR%\%EXPORT_VIEWER_NAME%.exe" del /f /q "%DIST_DIR%\%EXPORT_VIEWER_NAME%.exe" >nul 2>&1
+rem --- Clean previous build artifacts for this target ---
+if exist "%DIST_DIR%\%APP_NAME%.exe" del /f /q "%DIST_DIR%\%APP_NAME%.exe" >nul 2>&1
 if exist "%BUILD_DIR%\export_viewer" rmdir /s /q "%BUILD_DIR%\export_viewer" >nul 2>&1
-if exist "%SPEC_DIR%\%EXPORT_VIEWER_NAME%.spec" del /f /q "%SPEC_DIR%\%EXPORT_VIEWER_NAME%.spec" >nul 2>&1
+if exist "%SPEC_DIR%\%APP_NAME%.spec" del /f /q "%SPEC_DIR%\%APP_NAME%.spec" >nul 2>&1
 
-rem =============================================
-echo [INFO] Building %EXPORT_VIEWER_NAME%...
-echo =============================================
-py -3 -m PyInstaller %COMMON_ARGS% --workpath "%BUILD_DIR%\export_viewer" --name "%EXPORT_VIEWER_NAME%" --icon "%ICON_FILE%" "%EXPORT_VIEWER_SCRIPT%"
+echo [INFO] Building %APP_NAME%...
+py -3 -m PyInstaller %COMMON_ARGS% --workpath "%BUILD_DIR%\export_viewer" --name "%APP_NAME%" --icon "%ICON_FILE%" "%ENTRY_SCRIPT%"
 if errorlevel 1 (
-    echo [ERROR] %EXPORT_VIEWER_NAME% build failed.
+    echo [ERROR] %APP_NAME% build failed.
     popd >nul
     exit /b 1
 )
-echo [OK] %EXPORT_VIEWER_NAME% done: "%DIST_DIR%\%EXPORT_VIEWER_NAME%.exe"
 
-echo.
-echo =============================================
-echo [DONE] Build completed:
-echo   "%DIST_DIR%\%EXPORT_VIEWER_NAME%.exe"
-echo =============================================
-
+echo [OK] %APP_NAME% done: "%DIST_DIR%\%APP_NAME%.exe"
 popd >nul
 exit /b 0
