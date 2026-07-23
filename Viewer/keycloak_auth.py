@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 import time
-import requests
 import hashlib
 import base64
 import secrets
 import re
+
+from shared.http_client import create_session, post as http_post
 
 KEYCLOAK_BASE = "https://keycloak.bim-info.ru"
 REALM = "bwv-production"
@@ -63,7 +64,7 @@ class KeycloakAuth:
             "scope": "openid profile email",
         }
         try:
-            r = requests.post(TOKEN_URL, data=data, timeout=15)
+            r = http_post(TOKEN_URL, data=data, timeout=15)
             if r.status_code == 200:
                 self._store_tokens(r.json())
                 return True, "Авторизация прошла успешно (ROPC)"
@@ -72,7 +73,7 @@ class KeycloakAuth:
             return False, f"ROPC: {e}"
 
     def _try_browser_login(self, username: str, password: str) -> tuple[bool, str]:
-        sess = requests.Session()
+        sess = create_session()
         sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -160,7 +161,7 @@ class KeycloakAuth:
             "refresh_token": self.refresh_token_value,
         }
         try:
-            r = requests.post(TOKEN_URL, data=data, timeout=15)
+            r = http_post(TOKEN_URL, data=data, timeout=15)
             if r.status_code == 200:
                 self._store_tokens(r.json())
                 return True, "Токен обновлён"

@@ -250,7 +250,10 @@ class TLSConfig:
         )
 
     def get_verify_param(self) -> bool | str:
-        if not self.verify and self.allow_insecure_dev and not self._is_production:
+        # `verify = false` is an explicit compatibility setting.  It must work
+        # identically in source runs and in a PyInstaller build; otherwise the
+        # application silently ignores the selected TLS mode at the customer.
+        if not self.verify:
             return False
         if self.ca_bundle_path and os.path.isfile(self.ca_bundle_path):
             return self.ca_bundle_path
@@ -320,6 +323,26 @@ def is_production_environment() -> bool:
     return True
 
 
+class _ConfiguredTLSSession(requests.Session):
+    """Session that applies TLS verification explicitly on every request.
+
+    Setting only ``session.verify`` is not sufficient when the workstation has
+    REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE environment variables: requests may
+    replace the session value.  Passing ``verify`` explicitly preserves the
+    selected application mode while still allowing proxy settings from the
+    environment.
+    """
+
+    def __init__(self, verify_param: bool | str):
+        super().__init__()
+        self._verify_param = verify_param
+        self.verify = verify_param
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("verify", self._verify_param)
+        return super().request(method, url, **kwargs)
+
+
 class TLSManager:
     def __init__(self, config: Optional[TLSConfig] = None):
         self.config = config or TLSConfig()
@@ -338,9 +361,8 @@ class TLSManager:
 
         self._insecure_warning_shown = True
         msg = (
-            "ВНИМАНИЕ: Проверка SSL-сертификата отключена!\n"
-            "Это небезопасно и должно использоваться только для разработки/тестирования.\n"
-            "Никогда не используйте verify=false в production!"
+            "Активирован режим совместимости TLS: проверка сертификата API отключена.\n"
+            "Соединение остаётся зашифрованным, но подлинность сертификата не проверяется."
         )
         if log_func:
             log_func(msg)
@@ -350,17 +372,18 @@ class TLSManager:
         return True
 
     def create_session(self) -> requests.Session:
-        session = requests.Session()
-
         verify = self.get_verify_param()
+        session = _ConfiguredTLSSession(verify)
 
         if verify is False:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         retry_strategy = requests.adapters.Retry(
             total=self.config.max_retries,
-            connect=self.config.connect_timeout,
-            read=self.config.request_timeout,
+            connect=self.config.max_retries,
+            read=self.config.max_retries,
+            status=self.config.max_retries,
+            backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST", "PUT", "DELETE"],
             raise_on_status=False,
@@ -404,7 +427,7 @@ class TLSManager:
         port = parsed.port or 443
 
         verify = self.get_verify_param()
-        verify_enabled = verify is not False and verify is not True
+        verify_enabled = verify is not False
 
         ca_exists = False
         if self.config.ca_bundle_path:

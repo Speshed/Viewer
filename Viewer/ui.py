@@ -5,7 +5,7 @@ v12: В логах вместо "Контейнер N" показываются 
 Сопоставление по базовому имени (без расширений/регистра/символов).
 """
 
-import sys, json, requests, os, re, tempfile
+import sys, json, os, re, tempfile
 
 
 # --- Qt imports ---
@@ -38,6 +38,7 @@ from shared.theme_toggle import (
 )
 from shared.dialogs import show_dialog, wire_message_box_buttons
 from Viewer.keycloak_auth import KeycloakAuth
+from shared.http_client import get as http_get, post as http_post
 
 KEYCLOAK_AUTH = KeycloakAuth()
 
@@ -746,7 +747,7 @@ class _PasswordLineEdit(QLineEdit):
 # --- Utils ---
 def api_get(url, headers, params=None, timeout=10):
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        r = http_get(url, headers=headers, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -1221,7 +1222,7 @@ class MainWindow(QMainWindow):
         self._token_btn.setEnabled(False)
         self.auth_status.setText("Проверка...")
         try:
-            r = requests.get(f"{self._get_external_base_url()}/api/projects/all", headers=EXTERNAL_HEADERS, timeout=5)
+            r = http_get(f"{self._get_external_base_url()}/api/projects/all", headers=EXTERNAL_HEADERS, timeout=5)
             if r.status_code == 200:
                 self._auth_ok = True
                 self.auth_status.setText("Авторизован")
@@ -1518,7 +1519,7 @@ class MainWindow(QMainWindow):
                     "elementMaps": [{"containerId": container_id, "elementIds": matched_ids}],
                     "stringValue": value
                 }
-                create_resp = requests.post(
+                create_resp = http_post(
                     f"{_internal_base_url()}/imcParameterDefinition/imcParameterDefinition",
                     headers={"Content-Type": "application/json"},
                     data=json.dumps(create_data, ensure_ascii=False)
@@ -1537,7 +1538,7 @@ class MainWindow(QMainWindow):
                 "isNumeric": False,
                 "stringValue": value
             }
-            update_resp = requests.post(
+            update_resp = http_post(
                 f"{_internal_base_url()}/imcParameterValue/setAlternateValueByElements",
                 headers=INTERNAL_HEADERS,
                 data=json.dumps(update_data, ensure_ascii=False)

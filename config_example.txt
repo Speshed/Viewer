@@ -1,5 +1,0 @@
-[DATABASE]
-server = .\SQLEXPRESS
-database = viewer_old
-username = login_ibim
-password = passw_ibim

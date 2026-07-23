@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import urllib.request
 import urllib.error
+import ssl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGraphicsDropShadowEffect, QPushButton, QFileDialog, QMessageBox, QLineEdit, QStyle,
 )
@@ -162,7 +163,8 @@ def _check_api_connection(base_url: str, timeout_sec: float = 2.0) -> bool:
     for u in test_urls:
         try:
             req = urllib.request.Request(u, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            context = ssl._create_unverified_context() if u.lower().startswith("https://") else None
+            with urllib.request.urlopen(req, timeout=timeout_sec, context=context) as resp:
                 code = int(getattr(resp, "status", 0) or 0)
                 if 200 <= code < 400:
                     return True

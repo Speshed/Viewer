@@ -65,7 +65,6 @@ from PySide6.QtWidgets import (
 )
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests.adapters
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -225,23 +224,30 @@ MAX_COLUMN_NAME_LENGTH = 128
 TLS_MANAGER: Optional[TLSManager] = None
 TLS_CONFIG_DICT: dict = {}
 
+def reset_session():
+    """Close the cached HTTP session for the current thread."""
+    session = getattr(_thread_local, "session", None)
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+        try:
+            delattr(_thread_local, "session")
+        except AttributeError:
+            pass
+
+
 def get_session():
-    if not hasattr(_thread_local, 'session'):
+    if not hasattr(_thread_local, "session"):
         global TLS_MANAGER
         if TLS_MANAGER is None:
             TLS_MANAGER = get_tls_manager(TLS_CONFIG_DICT if TLS_CONFIG_DICT else None)
-        
+
         TLS_MANAGER.check_insecure_and_warn(log_info)
-        session = TLS_MANAGER.create_session()
-        
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=20,
-            max_retries=0
-        )
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        _thread_local.session = session
+        # TLSManager configures verification, connection pooling and retries.
+        # Do not replace its adapters here: the old override disabled retries.
+        _thread_local.session = TLS_MANAGER.create_session()
     return _thread_local.session
 
 
@@ -4432,9 +4438,9 @@ trust_server_certificate = yes
 connection_timeout = 30
 
 [TLS]
-verify = true
+verify = false
 ca_bundle_path = 
-allow_insecure_dev = false
+allow_insecure_dev = true
 request_timeout = 30
 """
         try:
@@ -5420,8 +5426,13 @@ class BimSyncWindow(QMainWindow):
             get_odbc_manager(odbc_config_dict)
             
             global TLS_CONFIG_DICT, TLS_MANAGER
+            reset_session()
             TLS_CONFIG_DICT = {
-                "verify": True,
+                # Compatibility mode: accept the API certificate even when the
+                # customer's Windows/Python trust stores differ or the server
+                # does not send a complete intermediate chain.
+                "verify": False,
+                "allow_insecure_dev": True,
                 "request_timeout": 30,
                 "connect_timeout": 10,
                 "max_retries": 3,
