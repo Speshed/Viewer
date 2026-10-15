@@ -8,6 +8,7 @@ import time
 import re
 import json
 from datetime import datetime
+from contextlib import contextmanager
 from typing import Optional
 
 import pandas as pd
@@ -669,11 +670,20 @@ def log_debug(message):
 
 
 def log_error(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n[ОШИБКА] {timestamp}\n")
+        f.write(f"\n[ОШИБКА] {timestamp} | поток={threading.current_thread().name}\n")
         f.write(f"{message}\n")
         f.write("-" * 40 + "\n")
+
+
+def log_exception(stage, error):
+    """Пишем реальный тип исключения и traceback, в т.ч. для MemoryError без текста."""
+    log_error(f"{stage}: {type(error).__name__}: {error!s}\n{traceback.format_exc()}")
+
+
+def error_description(error):
+    return str(error).strip() or type(error).__name__
 
 THEME_LIGHT = "light"
 THEME_DARK = "dark"
@@ -2039,20 +2049,100 @@ def get_connection_str(db_config, manager=None):
     )
 
 
-INSERT_CHUNK_SIZE = 10000
+# Меньшие пакеты ограничивают выделение памяти pyodbc.fast_executemany.
+INSERT_CHUNK_SIZE = 1000
 
-def save_properties_to_sql(df_properties, schema="staging", db_config=None):
-    if df_properties.empty:
+
+@contextmanager
+def _sql_connection(db_config=None, connection=None):
+    """Заимствованный коннект не закрываем и не коммитим: это делает общий владелец транзакции."""
+    if connection is not None:
+        yield connection
+        return
+    conn = pyodbc.connect(get_connection_str(db_config), autocommit=False)
+    try:
+        yield conn
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception as exc:
+            log_error(f"Ошибка отката SQL-транзакции: {type(exc).__name__}: {exc}")
+        raise
+    finally:
+        conn.close()
+
+
+def _sql_commit_if_owned(conn, borrowed_connection):
+    if borrowed_connection is None:
+        conn.commit()
+
+
+def _use_fast_executemany():
+    """Старый встроенный 'SQL Server' несовместим с быстрыми буферами pyodbc."""
+    override = os.environ.get("LARIX_SQL_FAST_EXECUTEMANY", "").strip().lower()
+    if override in ("0", "no", "false", "off"):
+        return False
+    if override in ("1", "yes", "true", "on"):
+        return True
+    return get_odbc_manager().get_driver() in (ODBCDriver.ODBC_18, ODBCDriver.ODBC_17)
+
+
+def _iter_dataframe_chunks(df, chunk_size=INSERT_CHUNK_SIZE):
+    for start in range(0, len(df), chunk_size):
+        block = df.iloc[start:start + chunk_size].astype(object)
+        block = block.where(pd.notnull(block), None)
+        yield [tuple(row) for row in block.itertuples(index=False, name=None)]
+
+
+def _execute_sql_batches(cursor, query, chunks, table_name, expected_count=None, fast=None, progress_callback=None):
+    if fast is None:
+        fast = _use_fast_executemany()
+    cursor.fast_executemany = fast
+    inserted = 0
+    started = time.monotonic()
+    log_info(f"[SQL] {table_name}: начало вставки, ожидается={expected_count}, "
+             f"fast_executemany={fast}, размер_пакета={INSERT_CHUNK_SIZE}")
+    for idx, batch in enumerate(chunks, 1):
+        if not batch:
+            continue
+        batch_started = time.monotonic()
+        # START пишем до вызова драйвера: при зависании видно точный пакет.
+        log_debug(f"[SQL] {table_name}: START пакет={idx}, строк={len(batch)}, уже_вставлено={inserted}")
+        try:
+            cursor.executemany(query, batch)
+        except BaseException as exc:
+            log_exception(f"[SQL] {table_name}: ошибка пакета={idx}, строк={len(batch)}, "
+                          f"успешно_до_ошибки={inserted}, fast={fast}", exc)
+            raise
+        inserted += len(batch)
+        if idx == 1 or idx % 10 == 0 or (expected_count is not None and inserted == expected_count):
+            log_info(f"[SQL] {table_name}: OK пакет={idx}, строк_всего={inserted}"
+                     f"/{expected_count if expected_count is not None else '?'}, "
+                     f"время_пакета={time.monotonic() - batch_started:.2f} сек, "
+                     f"время_всего={time.monotonic() - started:.1f} сек")
+            if progress_callback is not None:
+                progress_callback(inserted, expected_count)
+    if expected_count is not None and inserted != expected_count:
+        raise RuntimeError(f"SQL {table_name}: ожидалось {expected_count} строк, передано {inserted}")
+    log_info(f"[SQL] {table_name}: все пакеты переданы, строк={inserted}, "
+             f"время={time.monotonic() - started:.1f} сек (ещё не COMMIT)")
+    return inserted
+
+
+def save_properties_to_sql(df_properties, schema="staging", db_config=None, connection=None, progress_callback=None):
+    # При SQL-выгрузке получаем уже существующий список словарей из API — не
+    # строим второй многогигабайтный DataFrame и список из миллионов кортежей.
+    if df_properties is None or len(df_properties) == 0:
         return
     
     sql_start = time.time()
     conn_str = get_connection_str(db_config)
     table_name = f"{schema}.ElementProperties"
     
-    with pyodbc.connect(conn_str) as conn:
+    with _sql_connection(db_config, connection) as conn:
         cursor = conn.cursor()
         cursor.execute(f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}') EXEC('CREATE SCHEMA {schema}')")
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
         
         create_sql = f"""
         IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'{table_name}') AND type = 'U')
@@ -2066,26 +2156,32 @@ def save_properties_to_sql(df_properties, schema="staging", db_config=None):
         )
         """
         cursor.execute(create_sql)
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
         
-        df_clean = df_properties.where(pd.notnull(df_properties), None)
-        records = [tuple(row) for row in df_clean.values]
-        placeholders = ", ".join(["?" for _ in df_properties.columns])
-        insert_sql = f"INSERT INTO {table_name} VALUES ({placeholders})"
-        
-        cursor.fast_executemany = True
-        total_inserted = 0
-        for i in range(0, len(records), INSERT_CHUNK_SIZE):
-            chunk = records[i:i + INSERT_CHUNK_SIZE]
-            cursor.executemany(insert_sql, chunk)
-            total_inserted += len(chunk)
-            log_debug(f"EAV insert: chunk {i//INSERT_CHUNK_SIZE + 1}, {len(chunk)} записей")
-        conn.commit()
+        if isinstance(df_properties, pd.DataFrame):
+            columns = list(df_properties.columns)
+            chunks = _iter_dataframe_chunks(df_properties)
+        else:
+            columns = ["idElement", "idModel", "idProject", "propertyPath", "propertyValue", "last_updated"]
+            def property_batches():
+                for offset in range(0, len(df_properties), INSERT_CHUNK_SIZE):
+                    yield [tuple(entry.get(col) for col in columns)
+                           for entry in df_properties[offset:offset + INSERT_CHUNK_SIZE]]
+            chunks = property_batches()
+        placeholders = ", ".join(["?" for _ in columns])
+        col_names = ", ".join(f"[{col}]" for col in columns)
+        insert_sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
+        total_inserted = _execute_sql_batches(
+            cursor, insert_sql, chunks,
+            table_name, expected_count=len(df_properties), progress_callback=progress_callback
+        )
+        log_info(f"[SQL] {table_name}: перед фиксацией транзакции, inserted={total_inserted}")
+        _sql_commit_if_owned(conn, connection)
     
     log_timing("EAV INSERT (ElementProperties)", sql_start, total_inserted)
 
 
-def save_properties_wide_to_sql(properties_list, property_paths, schema="staging", db_config=None, include_empty_rows=False, df_elements=None):
+def save_properties_wide_to_sql(properties_list, property_paths, schema="staging", db_config=None, include_empty_rows=False, df_elements=None, connection=None):
     if not properties_list and not (include_empty_rows and df_elements is not None and not df_elements.empty):
         return
     
@@ -2126,10 +2222,10 @@ def save_properties_wide_to_sql(properties_list, property_paths, schema="staging
     
     all_columns = ["idElement", "idModel", "idProject", "last_updated"] + [col_mapping[p] for p in property_paths]
     
-    with pyodbc.connect(conn_str) as conn:
+    with _sql_connection(db_config, connection) as conn:
         cursor = conn.cursor()
         cursor.execute(f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}') EXEC('CREATE SCHEMA {schema}')")
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
         
         existing_cols = []
         try:
@@ -2148,38 +2244,37 @@ def save_properties_wide_to_sql(properties_list, property_paths, schema="staging
             CREATE TABLE {table_name} ({', '.join(cols_def)})
             """
             cursor.execute(create_sql)
-            conn.commit()
+            _sql_commit_if_owned(conn, connection)
         else:
             for prop_path in property_paths:
                 col_name = col_mapping[prop_path]
                 if col_name not in existing_cols:
                     cursor.execute(f"ALTER TABLE {table_name} ADD [{col_name}] NVARCHAR(MAX)")
-                    conn.commit()
-        
-        records = []
-        for elem_data in elements_dict.values():
-            row = []
-            for col in all_columns:
-                row.append(elem_data.get(col))
-            records.append(tuple(row))
+                    _sql_commit_if_owned(conn, connection)
         
         placeholders = ", ".join(["?" for _ in all_columns])
         col_names = ", ".join([f"[{c}]" for c in all_columns])
         insert_sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
-        
-        cursor.fast_executemany = True
-        total_inserted = 0
-        for i in range(0, len(records), INSERT_CHUNK_SIZE):
-            chunk = records[i:i + INSERT_CHUNK_SIZE]
-            cursor.executemany(insert_sql, chunk)
-            total_inserted += len(chunk)
-            log_debug(f"Wide insert: chunk {i//INSERT_CHUNK_SIZE + 1}, {len(chunk)} записей")
-        conn.commit()
+
+        def wide_batches():
+            batch = []
+            for elem_data in elements_dict.values():
+                batch.append(tuple(elem_data.get(col) for col in all_columns))
+                if len(batch) >= INSERT_CHUNK_SIZE:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+
+        total_inserted = _execute_sql_batches(
+            cursor, insert_sql, wide_batches(), table_name, expected_count=len(elements_dict)
+        )
+        _sql_commit_if_owned(conn, connection)
     
     log_timing(f"Wide INSERT (ElementPropertiesWide), {len(property_paths)} столбцов", sql_start, total_inserted)
 
 
-def save_status_attributes_to_sql(df_statuses, schema="staging", db_config=None):
+def save_status_attributes_to_sql(df_statuses, schema="staging", db_config=None, connection=None):
     if df_statuses.empty:
         return
 
@@ -2200,10 +2295,10 @@ def save_status_attributes_to_sql(df_statuses, schema="staging", db_config=None)
         "last_updated",
     ]
 
-    with pyodbc.connect(conn_str) as conn:
+    with _sql_connection(db_config, connection) as conn:
         cursor = conn.cursor()
         cursor.execute(f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}') EXEC('CREATE SCHEMA {schema}')")
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
         create_sql = f"""
         IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'{table_name}') AND type = 'U')
@@ -2222,7 +2317,7 @@ def save_status_attributes_to_sql(df_statuses, schema="staging", db_config=None)
         )
         """
         cursor.execute(create_sql)
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
         df_clean = df_statuses.where(pd.notnull(df_statuses), None).copy()
         for col in columns:
@@ -2230,19 +2325,15 @@ def save_status_attributes_to_sql(df_statuses, schema="staging", db_config=None)
                 df_clean[col] = None
         if "last_updated" in df_clean.columns:
             df_clean["last_updated"] = pd.to_datetime(df_clean["last_updated"], errors="coerce")
-        records = [tuple(row) for row in df_clean.reindex(columns=columns).values]
+        prepared = df_clean.reindex(columns=columns)
         placeholders = ", ".join(["?" for _ in columns])
         col_names = ", ".join([f"[{col}]" for col in columns])
         insert_sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
-
-        cursor.fast_executemany = True
-        total_inserted = 0
-        for i in range(0, len(records), INSERT_CHUNK_SIZE):
-            chunk = records[i:i + INSERT_CHUNK_SIZE]
-            cursor.executemany(insert_sql, chunk)
-            total_inserted += len(chunk)
-            log_debug(f"Status insert: chunk {i//INSERT_CHUNK_SIZE + 1}, {len(chunk)} записей")
-        conn.commit()
+        total_inserted = _execute_sql_batches(
+            cursor, insert_sql, _iter_dataframe_chunks(prepared),
+            table_name, expected_count=len(prepared)
+        )
+        _sql_commit_if_owned(conn, connection)
 
     log_timing("SQL INSERT (ElementStatusAttributes)", sql_start, total_inserted)
 
@@ -2485,16 +2576,16 @@ def get_elements_tree_table(site, token, jimc_id):
     return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame()
 
 
-def save_table_to_sql(df, table_name, schema="staging", key_columns=None, db_config=None):
+def save_table_to_sql(df, table_name, schema="staging", key_columns=None, db_config=None, connection=None):
     if df.empty:
         return
     conn_str = get_connection_str(db_config)
     full_name = f"{schema}.{table_name}"
     temp_name = f"{schema}.#temp_{table_name}_{int(datetime.now().timestamp())}"
-    with pyodbc.connect(conn_str) as conn:
+    with _sql_connection(db_config, connection) as conn:
         cursor = conn.cursor()
         cursor.execute(f"IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}') EXEC('CREATE SCHEMA {schema}')")
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
         cols_def = []
         for col in df.columns:
@@ -2509,16 +2600,16 @@ def save_table_to_sql(df, table_name, schema="staging", key_columns=None, db_con
         CREATE TABLE {full_name} ({', '.join(cols_def)})
         """
         cursor.execute(create_sql)
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
         cursor.execute(f"SELECT TOP 0 * INTO {temp_name} FROM {full_name}")
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
         df_clean = df.where(pd.notnull(df), None)
         records = [tuple(row) for row in df_clean.values]
         placeholders = ", ".join(["?" for _ in df.columns])
         cursor.executemany(f"INSERT INTO {temp_name} VALUES ({placeholders})", records)
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
         if key_columns:
             key_columns = [f"[{k}]" for k in key_columns]
@@ -2542,21 +2633,21 @@ def save_table_to_sql(df, table_name, schema="staging", key_columns=None, db_con
                 WHEN NOT MATCHED BY TARGET THEN INSERT ({insert_cols}) VALUES ({source_cols});
                 """
             cursor.execute(merge_sql)
-            conn.commit()
+            _sql_commit_if_owned(conn, connection)
         else:
             cursor.execute(f"INSERT INTO {full_name} SELECT * FROM {temp_name}")
-            conn.commit()
+            _sql_commit_if_owned(conn, connection)
 
         cursor.execute(f"DROP TABLE {temp_name}")
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
 
 
-def replace_elements_by_model_ids(df_elements, model_ids, schema="staging", db_config=None):
+def replace_elements_by_model_ids(df_elements, model_ids, schema="staging", db_config=None, connection=None):
     if not model_ids and df_elements.empty:
         return
     conn_str = get_connection_str(db_config)
     table_name = f"{schema}.Elements"
-    with pyodbc.connect(conn_str) as conn:
+    with _sql_connection(db_config, connection) as conn:
         cursor = conn.cursor()
         if not df_elements.empty:
             cols_def = []
@@ -2572,43 +2663,49 @@ def replace_elements_by_model_ids(df_elements, model_ids, schema="staging", db_c
             CREATE TABLE {table_name} ({', '.join(cols_def)})
             """
             cursor.execute(create_sql)
-            conn.commit()
+            _sql_commit_if_owned(conn, connection)
 
-        if model_ids:
+        if model_ids and _table_exists(cursor, table_name):
             placeholders = ','.join('?' * len(model_ids))
+            log_info(f"[SQL] {table_name}: начало замены моделей, ids={_preview_ids(list(model_ids))}")
             cursor.execute(f"DELETE FROM {table_name} WHERE [idModel] IN ({placeholders})", model_ids)
-            conn.commit()
+            log_info(f"[SQL] {table_name}: удалено прежних строк={cursor.rowcount}")
+            _sql_commit_if_owned(conn, connection)
 
         if not df_elements.empty:
             df_clean = df_elements.where(pd.notnull(df_elements), None)
             if "idModel" in df_clean.columns:
                 df_clean = df_clean.dropna(subset=["idModel"])
                 df_clean["idModel"] = df_clean["idModel"].astype(int)
-            records = [tuple(row) for row in df_clean.values]
-            placeholders = ", ".join(["?" for _ in df_elements.columns])
-            cursor.executemany(f"INSERT INTO {table_name} VALUES ({placeholders})", records)
-            conn.commit()
+            placeholders = ", ".join(["?" for _ in df_clean.columns])
+            col_names = ", ".join(f"[{col}]" for col in df_clean.columns)
+            insert_sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
+            _execute_sql_batches(
+                cursor, insert_sql, _iter_dataframe_chunks(df_clean),
+                table_name, expected_count=len(df_clean), fast=False
+            )
+            _sql_commit_if_owned(conn, connection)
 
 
-def delete_properties_by_model_ids(model_ids, schema="staging", db_config=None):
+def delete_properties_by_model_ids(model_ids, schema="staging", db_config=None, connection=None, strict=False):
     if not model_ids:
         return
     return _delete_rows_by_ids(
         [f"{schema}.ElementProperties", f"{schema}.ElementPropertiesWide"],
         "idModel",
         model_ids,
-        db_config=db_config,
+        db_config=db_config, connection=connection, strict=strict,
     )
 
 
-def delete_status_attributes_by_model_ids(model_ids, schema="staging", db_config=None):
+def delete_status_attributes_by_model_ids(model_ids, schema="staging", db_config=None, connection=None, strict=False):
     if not model_ids:
         return
     return _delete_rows_by_ids(
         [f"{schema}.ElementStatusAttributes"],
         "idModel",
         model_ids,
-        db_config=db_config,
+        db_config=db_config, connection=connection, strict=strict,
     )
 
 
@@ -2803,7 +2900,7 @@ def check_database_delete_prerequisites(schema="staging", db_config=None):
     return diagnostics, problems
 
 
-def _delete_rows_by_ids(table_names, column_name, ids, db_config=None):
+def _delete_rows_by_ids(table_names, column_name, ids, db_config=None, connection=None, strict=False):
     if not ids:
         return []
     target_server = (db_config or {}).get("server", "")
@@ -2813,7 +2910,7 @@ def _delete_rows_by_ids(table_names, column_name, ids, db_config=None):
         f"column={column_name}, ids_count={len(ids)}, ids=[{_preview_ids(list(ids))}]"
     )
     conn_str = get_connection_str(db_config)
-    with pyodbc.connect(conn_str) as conn:
+    with _sql_connection(db_config, connection) as conn:
         cursor = conn.cursor()
         placeholders = ','.join('?' * len(ids))
         params = list(ids)
@@ -2824,6 +2921,13 @@ def _delete_rows_by_ids(table_names, column_name, ids, db_config=None):
                 results.append({"table": table, "deleted": 0, "skipped": True})
                 continue
             try:
+                if strict:
+                    log_debug(f"[SQL] {table}: DELETE начало, по_полю={column_name}, ids={_preview_ids(params)}")
+                    cursor.execute(f"DELETE FROM {table} WHERE [{column_name}] IN ({placeholders})", params)
+                    deleted = int(cursor.rowcount) if cursor.rowcount >= 0 else -1
+                    log_info(f"[SQL] {table}: DELETE завершён, строк={deleted} (до COMMIT)")
+                    results.append({"table": table, "deleted": max(0, deleted), "skipped": False})
+                    continue
                 matched_before = _count_rows_by_ids(cursor, table, column_name, params)
                 total_before = _count_rows(cursor, table)
                 cursor.execute(f"DELETE FROM {table} WHERE [{column_name}] IN ({placeholders})", params)
@@ -2847,7 +2951,9 @@ def _delete_rows_by_ids(table_names, column_name, ids, db_config=None):
                     f"rowcount={deleted}"
                 )
             except Exception as exc:
-                log_error(f"Ошибка удаления из {table} по {column_name}: {exc}\n{traceback.format_exc()}")
+                log_exception(f"Удаление из {table} по {column_name}", exc)
+                if strict:
+                    raise
                 results.append(
                     {
                         "table": table,
@@ -2857,7 +2963,7 @@ def _delete_rows_by_ids(table_names, column_name, ids, db_config=None):
                         "skipped": False,
                     }
                 )
-        conn.commit()
+        _sql_commit_if_owned(conn, connection)
         total_deleted = sum(
             int(item.get("deleted", 0))
             for item in results
@@ -3183,11 +3289,11 @@ class SyncWorker(QThread):
                         log_error(f"Ошибка соединения (попытка {retry_count}/{max_retries}), jimc_id={jimc_id}, страница={page}\n{e}")
                         time.sleep(retry_delay)
                     else:
-                        log_error(f"Превышено количество попыток, jimc_id={jimc_id}, страница={page}\n{e}")
-                        return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame(), page, False
+                        log_exception(f"API элементов jimc_id={jimc_id}, страница={page}: попытки исчерпаны", e)
+                        raise RuntimeError(f"Не удалось полностью загрузить элементы модели {jimc_id}, страница {page}") from e
                 except Exception as e:
-                    log_error(f"Ошибка при загрузке элементов модели {jimc_id}, страница={page}\n{traceback.format_exc()}")
-                    return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame(), page, False
+                    log_exception(f"API элементов модели {jimc_id}, страница={page}", e)
+                    raise
         
         return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame(), page, False
 
@@ -3243,12 +3349,14 @@ class SyncWorker(QThread):
                     time.sleep(retry_delay)
                 else:
                     log_error(f"Превышено количество попыток для свойств, jimc_id={jimc_id}")
-                    return []
+                    raise RuntimeError(f"Не удалось получить свойства модели {jimc_id} после {max_retries} попыток") from e
             except Exception as e:
-                log_error(f"Ошибка при запросе свойств: {e}")
-                return []
+                log_exception(f"API свойств модели {jimc_id}", e)
+                raise
         
-        return []
+        if self._cancel_requested:
+            return []
+        raise RuntimeError(f"Не удалось получить свойства модели {jimc_id}: все попытки исчерпаны")
 
     def _get_status_values_with_retry(self, site, jimc_id, attribute_id):
         if not attribute_id:
@@ -3300,12 +3408,14 @@ class SyncWorker(QThread):
                     time.sleep(retry_delay)
                 else:
                     log_error(f"Превышено количество попыток для статусов, jimc_id={jimc_id}, attribute_id={attribute_id}")
-                    return []
+                    raise RuntimeError(f"Не удалось получить статусы модели {jimc_id} после {max_retries} попыток") from e
             except Exception as e:
-                log_error(f"Ошибка при запросе статусов: {e}")
-                return []
+                log_exception(f"API статусов модели {jimc_id}", e)
+                raise
 
-        return []
+        if self._cancel_requested:
+            return []
+        raise RuntimeError(f"Не удалось получить статусы модели {jimc_id}: все попытки исчерпаны")
 
     def run(self):
         global sync_time_str
@@ -3545,7 +3655,10 @@ class SyncWorker(QThread):
                                                 completed_batches += 1
                                                 
                                                 if error:
-                                                    log_error(f"Ошибка в батче {batch_idx}: {error}")
+                                                    log_error(f"API: ошибка пакета={batch_idx + 1}/{total_batches} "
+                                                              f"модели {jimc_id}: {type(error).__name__}: {error}")
+                                                    raise RuntimeError(f"Не все свойства модели {jimc_id} были получены "
+                                                                       f"(пакет {batch_idx + 1}/{total_batches})") from error
                                                 
                                                 if results:
                                                     with props_lock:
@@ -3564,7 +3677,8 @@ class SyncWorker(QThread):
                             else:
                                 log_info(f"МОДЕЛЬ ПРОПУЩЕНА: {model_name} — jimc_id пустой или None")
                         except Exception as e:
-                            log_error(f"Ошибка загрузки модели {jimc_id} ({model_name}):\n{traceback.format_exc()}")
+                            log_exception(f"Ошибка загрузки модели {jimc_id} ({model_name}); выгрузка остановлена для защиты данных", e)
+                            raise
 
                         log_info(f"{project_name} | {model_name} | {elem_count} элементов | {props_count} свойств")
 
@@ -3574,50 +3688,104 @@ class SyncWorker(QThread):
             df_projects = pd.concat(all_projects, ignore_index=True) if all_projects else pd.DataFrame()
             df_models = pd.concat(all_models, ignore_index=True) if all_models else pd.DataFrame()
             df_elements = pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame()
-            df_properties = pd.DataFrame(all_properties) if all_properties else pd.DataFrame()
+            df_properties = all_properties  # потоковая запись EAV, без дополнительного DataFrame
             df_statuses = pd.DataFrame(all_status_attributes) if all_status_attributes else pd.DataFrame()
 
             log_info(f"Данные для сохранения: проектов={len(df_projects)}, моделей={len(df_models)}, элементов={len(df_elements)}, свойств={len(df_properties)}, статусов={len(df_statuses)}")
 
             model_ids = df_models["idModel"].dropna().astype(int).unique().tolist() if not df_models.empty else []
 
-            t1 = time.time()
-            log_debug("Сохранение таблицы Projects...")
-            save_table_to_sql(df_projects, "Projects", key_columns=["idProject"], db_config=self.config)
-            log_timing("SQL INSERT Projects", t1, len(df_projects))
-            
-            t2 = time.time()
-            log_debug("Сохранение таблицы Models...")
-            save_table_to_sql(df_models, "Models", key_columns=["idModel"], db_config=self.config)
-            log_timing("SQL INSERT Models", t2, len(df_models))
-            
-            t3 = time.time()
-            log_debug("Сохранение таблицы Elements...")
-            replace_elements_by_model_ids(df_elements, model_ids, db_config=self.config)
-            log_timing("SQL INSERT Elements", t3, len(df_elements))
-            
-            if model_ids:
-                log_debug("Удаление старых свойств для обновляемых моделей...")
-                delete_properties_by_model_ids(model_ids, db_config=self.config)
-                if load_statuses:
-                    log_debug("Удаление старых статусов для обновляемых моделей...")
-                    delete_status_attributes_by_model_ids(model_ids, db_config=self.config)
+            # Вся запись (включая удаление прошлых данных) — одна SQL-транзакция.
+            # Ошибка на любом этапе откатывает и Elements, и EAV, и Wide, и Statuses.
+            manager = get_odbc_manager()
+            sql_driver = manager.get_driver().value
+            log_info(f"[SQL] Подключение: driver={sql_driver}, разрядность={get_process_bitness()}, "
+                     f"сервер={self.config.get('server')}, БД={self.config.get('database')}, "
+                     f"fast_executemany={_use_fast_executemany()}, пакет={INSERT_CHUNK_SIZE}")
+            if sql_driver == ODBCDriver.SQL_SERVER_LEGACY.value:
+                log_info("[SQL] ВНИМАНИЕ: устаревший драйвер SQL Server; "
+                         "fast_executemany отключён, рекомендуется ODBC Driver 18 x64")
+            sql_stage = "подключение к SQL Server"
+            tx_started = time.monotonic()
+            with _sql_connection(self.config) as sql_conn:
+                try:
+                    sql_conn.cursor().execute("SET XACT_ABORT ON")
+                    log_info("[SQL] Транзакция: XACT_ABORT ON, autocommit=False")
+                    sql_stage = "Projects"
+                    self.progress.emit(91, "Запись проектов в SQL Server...")
+                    t1 = time.time()
+                    save_table_to_sql(df_projects, "Projects", key_columns=["idProject"],
+                                      db_config=self.config, connection=sql_conn)
+                    log_timing("SQL INSERT Projects", t1, len(df_projects))
 
-            if not df_properties.empty:
-                t4 = time.time()
-                log_debug("Сохранение таблицы ElementProperties (EAV)...")
-                save_properties_to_sql(df_properties, db_config=self.config)
-                
-                t5 = time.time()
-                log_debug("Сохранение таблицы ElementPropertiesWide...")
-                save_properties_wide_to_sql(all_properties, self.selected_properties, db_config=self.config, include_empty_rows=self.include_empty_rows, df_elements=df_elements)
-                log_timing("SQL INSERT Wide Table", t5, len(df_properties))
+                    sql_stage = "Models"
+                    self.progress.emit(92, "Запись моделей в SQL Server...")
+                    t2 = time.time()
+                    save_table_to_sql(df_models, "Models", key_columns=["idModel"],
+                                      db_config=self.config, connection=sql_conn)
+                    log_timing("SQL INSERT Models", t2, len(df_models))
 
-            if not df_statuses.empty:
-                t6 = time.time()
-                log_debug("Сохранение таблицы ElementStatusAttributes...")
-                save_status_attributes_to_sql(df_statuses, db_config=self.config)
-                log_timing("SQL INSERT Status Attributes", t6, len(df_statuses))
+                    sql_stage = "Elements"
+                    self.progress.emit(93, "Запись элементов в SQL Server...")
+                    t3 = time.time()
+                    replace_elements_by_model_ids(df_elements, model_ids,
+                                                  db_config=self.config, connection=sql_conn)
+                    log_timing("SQL INSERT Elements", t3, len(df_elements))
+
+                    sql_stage = "удаление старых свойств"
+                    self.progress.emit(94, "Замена прежних свойств моделей...")
+                    if model_ids:
+                        if load_properties:
+                            delete_properties_by_model_ids(model_ids, db_config=self.config,
+                                                           connection=sql_conn, strict=True)
+                        if load_statuses:
+                            sql_stage = "удаление старых статусов"
+                            delete_status_attributes_by_model_ids(model_ids, db_config=self.config,
+                                                                  connection=sql_conn, strict=True)
+
+                    sql_stage = "ElementProperties (EAV)"
+                    self.progress.emit(95, "Запись свойств в SQL Server (EAV)...")
+                    if bool(df_properties):
+                        t4 = time.time()
+                        save_properties_to_sql(
+                            df_properties, db_config=self.config, connection=sql_conn,
+                            progress_callback=lambda done, total: self.progress.emit(
+                                95, f"Запись свойств EAV: {done:,} из {total:,} записей".replace(",", " ")
+                            ),
+                        )
+                        log_timing("SQL INSERT ElementProperties (EAV)", t4, len(df_properties))
+
+                    sql_stage = "ElementPropertiesWide"
+                    self.progress.emit(97, "Запись широкой таблицы свойств...")
+                    if load_properties and (bool(df_properties) or (self.include_empty_rows and not df_elements.empty)):
+                        t5 = time.time()
+                        save_properties_wide_to_sql(all_properties, self.selected_properties,
+                                                    db_config=self.config, include_empty_rows=self.include_empty_rows,
+                                                    df_elements=df_elements, connection=sql_conn)
+                        log_timing("SQL INSERT Wide Table", t5, len(df_properties))
+
+                    sql_stage = "ElementStatusAttributes"
+                    self.progress.emit(98, "Запись статусов в SQL Server...")
+                    if not df_statuses.empty:
+                        t6 = time.time()
+                        save_status_attributes_to_sql(df_statuses, db_config=self.config, connection=sql_conn)
+                        log_timing("SQL INSERT Status Attributes", t6, len(df_statuses))
+
+                    sql_stage = "COMMIT"
+                    self.progress.emit(99, "Подтверждение SQL-транзакции...")
+                    log_info(f"[SQL] COMMIT START: моделей={len(model_ids)}, элементов={len(df_elements)}, "
+                             f"свойств={len(df_properties)}, время_до_commit={time.monotonic()-tx_started:.1f} сек")
+                    sql_conn.commit()
+                    log_info(f"[SQL] COMMIT OK: данные подтверждены, "
+                             f"время_всего={time.monotonic()-tx_started:.1f} сек")
+                except BaseException as exc:
+                    log_exception(f"SQL сохранение: этап={sql_stage}; выполняется ROLLBACK", exc)
+                    try:
+                        sql_conn.rollback()
+                        log_info(f"[SQL] ROLLBACK OK: изменения выгрузки отменены, этап={sql_stage}")
+                    except Exception as rollback_exc:
+                        log_exception(f"[SQL] ROLLBACK ERROR: этап={sql_stage}", rollback_exc)
+                    raise
 
             if not SAVE_EMPTY_PROPERTIES and total_saved_props > 0:
                 log_info(f"ИТОГО свойств: сохранено {total_saved_props}, пропущено пустых {total_skipped_props}")
@@ -3636,9 +3804,11 @@ class SyncWorker(QThread):
                 "failed": [],
                 "elapsed": elapsed
             })
-        except requests.Timeout:
+        except requests.Timeout as e:
+            log_exception("Таймаут при синхронизации", e)
             self.error.emit("Превышено время ожидания ответа от сервера.\nПроверьте подключение к интернету.")
-        except requests.ConnectionError:
+        except requests.ConnectionError as e:
+            log_exception("Сбой сетевого подключения при синхронизации", e)
             self.error.emit("Не удалось подключиться к серверу.\nПроверьте подключение к интернету.")
         except requests.exceptions.SSLError as e:
             tls_error = classify_ssl_error(e, self.config.get("site", ""))
@@ -3652,13 +3822,15 @@ class SyncWorker(QThread):
             self.error.emit(e.get_user_message())
         except pyodbc.Error as e:
             odbc_err = classify_odbc_error(e)
-            log_error(f"pyodbc Error: {str(e)}")
-            self.error.emit(odbc_err.get_user_message())
+            log_exception("Ошибка pyodbc при SQL-синхронизации", e)
+            self.error.emit(odbc_err.get_user_message() + f"\n\nПодробности в {LOG_FILE}")
         except ValueError as e:
-            self.error.emit(str(e))
+            log_exception("Некорректные данные при синхронизации", e)
+            self.error.emit(error_description(e))
         except Exception as e:
-            logging.error(f"Критическая ошибка синхронизации: {e}\n{traceback.format_exc()}")
-            self.error.emit(f"Сбой синхронизации:\n{str(e)}\n\nПодробности в {LOG_FILE}")
+            log_exception("Критическая ошибка синхронизации", e)
+            self.error.emit(f"Сбой синхронизации ({type(e).__name__}):\n"
+                            f"{error_description(e)}\n\nПодробности в {LOG_FILE}")
 
 
 class PropertiesSelectDialog(QDialog):
@@ -7556,10 +7728,11 @@ class PowerBiSyncWorker(QThread):
                     if retry_count < max_retries:
                         time.sleep(retry_delay)
                     else:
-                        return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame(), page, False
+                        log_exception(f"API элементов jimc_id={jimc_id}, страница={page}: попытки исчерпаны", e)
+                        raise RuntimeError(f"Не удалось полностью загрузить элементы модели {jimc_id}, страница {page}") from e
                 except Exception as e:
-                    log_error(f"Ошибка при загрузке элементов модели {jimc_id}:\n{traceback.format_exc()}")
-                    return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame(), page, False
+                    log_exception(f"API элементов модели {jimc_id}, страница={page}", e)
+                    raise
         
         return pd.concat(all_elements, ignore_index=True) if all_elements else pd.DataFrame(), page, False
 
@@ -7610,12 +7783,14 @@ class PowerBiSyncWorker(QThread):
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
-                    return []
+                    raise RuntimeError(f"Не удалось получить свойства модели {jimc_id} после {max_retries} попыток") from e
             except Exception as e:
-                log_error(f"Ошибка при запросе свойств: {e}")
-                return []
+                log_exception(f"API свойств модели {jimc_id}", e)
+                raise
         
-        return []
+        if self._cancel_requested:
+            return []
+        raise RuntimeError(f"Не удалось получить свойства модели {jimc_id}: все попытки исчерпаны")
 
     def _get_status_values_with_retry(self, site, jimc_id, attribute_id):
         if not attribute_id:
@@ -7659,16 +7834,18 @@ class PowerBiSyncWorker(QThread):
                 response.raise_for_status()
                 return _extract_api_items(response.json())
 
-            except (requests.Timeout, requests.ConnectionError):
+            except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
-                    return []
+                    raise RuntimeError(f"Не удалось получить статусы модели {jimc_id} после {max_retries} попыток") from e
             except Exception as e:
-                log_error(f"Ошибка при запросе статусов: {e}")
-                return []
+                log_exception(f"API статусов модели {jimc_id}", e)
+                raise
 
-        return []
+        if self._cancel_requested:
+            return []
+        raise RuntimeError(f"Не удалось получить статусы модели {jimc_id}: все попытки исчерпаны")
 
     def run(self):
         start_time = time.time()
@@ -7891,7 +8068,10 @@ class PowerBiSyncWorker(QThread):
                                                 completed_batches += 1
                                                 
                                                 if error:
-                                                    log_error(f"Ошибка в батче {batch_idx}: {error}")
+                                                    log_error(f"API: ошибка пакета={batch_idx + 1}/{total_batches} "
+                                                              f"модели {jimc_id}: {type(error).__name__}: {error}")
+                                                    raise RuntimeError(f"Не все свойства модели {jimc_id} были получены "
+                                                                       f"(пакет {batch_idx + 1}/{total_batches})") from error
                                                 
                                                 if results:
                                                     with props_lock:
@@ -7905,7 +8085,8 @@ class PowerBiSyncWorker(QThread):
                                             total_skipped_props += skipped_props
                                         total_saved_props += props_count
                         except Exception as e:
-                            log_error(f"Ошибка загрузки модели {jimc_id} ({model_name}):\n{traceback.format_exc()}")
+                            log_exception(f"Ошибка загрузки модели {jimc_id} ({model_name}); выгрузка остановлена для защиты данных", e)
+                            raise
 
                         log_info(f"{project_name} | {model_name} | {elem_count} элементов | {props_count} свойств")
 
@@ -7951,13 +8132,16 @@ class PowerBiSyncWorker(QThread):
                 "elapsed": elapsed,
                 "output_path": self.output_path
             })
-        except requests.Timeout:
+        except requests.Timeout as e:
+            log_exception("Экспорт: таймаут", e)
             self.error.emit("Превышено время ожидания ответа от сервера.")
-        except requests.ConnectionError:
+        except requests.ConnectionError as e:
+            log_exception("Экспорт: ошибка подключения", e)
             self.error.emit("Не удалось подключиться к серверу.")
         except Exception as e:
-            logging.error(f"Критическая ошибка синхронизации: {e}\n{traceback.format_exc()}")
-            self.error.emit(f"Сбой синхронизации:\n{str(e)}\n\nПодробности в {LOG_FILE}")
+            log_exception("Критическая ошибка файлового экспорта", e)
+            self.error.emit(f"Сбой синхронизации ({type(e).__name__}):\n"
+                            f"{error_description(e)}\n\nПодробности в {LOG_FILE}")
 
 
 def main():

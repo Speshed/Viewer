@@ -1,0 +1,39 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller and packaging artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Runtime files
+*.log
+config.txt
+.env
+.env.*
+!.env.example
+
+# Generated exports
+выгрузка/
+
+# IDE and operating-system files
+.idea/
+.vs/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+desktop.ini
